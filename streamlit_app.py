@@ -300,13 +300,28 @@ def shape_geom(shape, W, H):
     return dict(n=4, h=math.hypot(W, H) / 2.0, kf=SQRT2 - 1.0, a_ref=(W + H) / 2.0, A_sharp=W * H, loss=4.0 - np.pi)
 
 
-def fill_min_for(size, model):
-    return model["fill_le20"] if size <= 20.0 + 1e-9 else model["fill_gt20"]
+KF_SQ = SQRT2 - 1.0
+KF_HEX = 2.0 / SQRT3 - 1.0
 
 
-def effective_die_R(size, R_design, model):
+def shape_kf(shape):
+    """꼭짓점 후퇴량 e = kf·R 의 kf (사각 0.414, 육각 0.155)"""
+    return KF_HEX if shape == SHAPE_HEX else KF_SQ
+
+
+def fill_min_for(size, model, shape=None):
+    """한 번 인발 최소 도달 R.
+    보정값(fill_le20/gt20)은 사각 R 기준 → '최소 꼭짓점 후퇴량 e = R·kf'가 형상과 무관하다고 보고 형상별 R로 환산
+    (육각: ×2.68 · 외부 육각 인발 데이터와 비교해 R 그대로 옮기는 것보다 잘 맞음)"""
+    if model.get("fill_override") is not None:
+        return float(model["fill_override"])
+    base = model["fill_le20"] if size <= 20.0 + 1e-9 else model["fill_gt20"]
+    return base * KF_SQ / shape_kf(shape)
+
+
+def effective_die_R(size, R_design, model, shape=None):
     """최소 도달 R = max(다이스 모서리 R, 한 번 인발 최소 R)"""
-    return max(R_design, fill_min_for(size, model))
+    return max(R_design, fill_min_for(size, model, shape))
 
 
 Z_GRID = np.linspace(-6.0, 6.0, 601)
@@ -338,7 +353,7 @@ def predict_R(shape, W, H, d0, R_design, model):
     G = shape_geom(shape, W, H)
     kf, a = G["kf"], G["a_ref"]
     g = G["h"] - d0 / 2.0
-    R_die = effective_die_R(a, R_design, model)
+    R_die = effective_die_R(a, R_design, model, shape)
     rmax = min(W, H) / 2.0 * 0.995
     f = _corner_dist(g, a, R_die, kf, model, rmax)
     sn = model["noise"]
@@ -365,7 +380,7 @@ def required_d0(shape, W, H, spec, conf, R_design, model):
     """P(R ≤ spec) ≥ conf 를 만족하는 최소 투입 선경 (갭 g 이분탐색)"""
     G = shape_geom(shape, W, H)
     kf, a = G["kf"], G["a_ref"]
-    R_die = effective_die_R(a, R_design, model)
+    R_die = effective_die_R(a, R_design, model, shape)
     rmax = min(W, H) / 2.0 * 0.995
     P = lambda g: float(_mix_cdf(spec, _corner_dist(g, a, R_die, kf, model, rmax), model["noise"])[0])
     lo, hi = -6.0, 6.0
@@ -478,8 +493,8 @@ st.markdown(f"""
   <table class="tblock">
     <tr><th>도구</th><td>인발 계산기 v2</td><th>단위</th><td class="mono">mm · kgf/mm²</td></tr>
     <tr><th>R 모델</th><td colspan="3">{MODEL.get('source', '')}</td></tr>
-    <tr><th>보정값</th><td colspan="3" class="mono">δ* {MODEL['delta_star']:.4f} · w* {MODEL['w_star']:.4f} · σε {MODEL['sigma']:.3f} · 최소충전 R {MODEL['fill_le20']:.2f}/{MODEL['fill_gt20']:.2f}</td></tr>
-    <tr><th>다이 R</th><td colspan="3">실측 확인 0.3R 또는 R 없음(샤프) · 같은 코드라도 다이마다 다름</td></tr>
+    <tr><th>보정값</th><td colspan="3" class="mono">δ* {MODEL['delta_star']:.4f} · w* {MODEL['w_star']:.4f} · σε {MODEL['sigma']:.3f} · 최소충전 R □ {MODEL['fill_le20']:.2f}/{MODEL['fill_gt20']:.2f} · HEX {MODEL['fill_le20'] * KF_SQ / KF_HEX:.2f}/{MODEL['fill_gt20'] * KF_SQ / KF_HEX:.2f}</td></tr>
+    <tr><th>다이 R</th><td colspan="3">사각: 실측 확인 0.3R 또는 R 없음(샤프) · 육각: 대부분 R 없음 · 육각 R은 사각 실측을 120° 모서리로 환산한 추정</td></tr>
   </table>
 </div>
 """, unsafe_allow_html=True)
@@ -518,7 +533,8 @@ with tab1:
         if shape_type != SHAPE_TR:
             r_max = float(min(W, H) / 2.0)
             die_choice = st.radio("다이스 모서리 R", list(DIE_R_OPTIONS.keys()), index=0, horizontal=True, key="t1_dier",
-                                  help="실측 확인 결과 0.3R 다이와 R 없는(샤프) 다이가 섞여 있습니다. 같은 다이 코드라도 다를 수 있으니 실제 다이를 확인해 선택하세요.")
+                                  help=("육각 다이는 대부분 R 없음(샤프)입니다. 실제 다이를 확인해 선택하세요." if shape_type == SHAPE_HEX else
+                                        "실측 확인 결과 0.3R 다이와 R 없는(샤프) 다이가 섞여 있습니다. 같은 다이 코드라도 다를 수 있으니 실제 다이를 확인해 선택하세요."))
             if DIE_R_OPTIONS[die_choice] is None:
                 R = st.number_input("다이스 모서리 R 직접 입력 (mm)", value=0.3, min_value=0.0, max_value=r_max, step=0.05, key="t1_dier_custom")
             else:
@@ -526,15 +542,29 @@ with tab1:
         else:
             R = H / 2.0
 
-    with st.expander("예측 옵션 (요구 R 상한 · 신뢰도 · 최소 도달 R)", expanded=False):
-        o1, o2, o3 = st.columns(3)
-        spec_R = o1.number_input("고객 요구 모서리 R 상한 (mm)", value=1.5, min_value=0.05, step=0.1, key="t1_spec")
-        conf = o2.slider("권장 선경 산출 신뢰도", 0.50, 0.99, 0.90, 0.01, key="t1_conf")
-        fm_default = fill_min_for((W + H) / 2.0, MODEL)
-        fill_min_in = o3.number_input("한 번 인발로 도달 가능한 최소 R (mm)", value=float(fm_default), min_value=0.0, step=0.05,
-                                      key=f"t1_fillmin_{fm_default:.3f}",
-                                      help="소재가 다이를 꽉 채워도 제품 모서리 R이 이 값 아래로는 잘 내려가지 않습니다. 실측 보정값: □≤20 0.83 mm, □>20 0.36 mm(불확실).")
-    MODEL_T1 = {**MODEL, "fill_le20": fill_min_in, "fill_gt20": fill_min_in}
+    is_hex = shape_type == SHAPE_HEX
+    e_min = None
+    with st.expander("예측 옵션 (요구 R 상한" + (" · 맞꼭지 최소 e" if is_hex else "") + " · 신뢰도 · 최소 도달 R)", expanded=False):
+        oc = st.columns(4 if is_hex else 3)
+        if is_hex:
+            spec_R = oc[0].number_input("고객 요구 모서리 R 상한 (mm)", value=3.0, min_value=0.05, step=0.1, key="t1_spec_hex",
+                                        help="육각은 꼭짓점이 조금만 덜 차도 R 값이 크게 나옵니다(후퇴 0.1 mm ≈ R 0.65 mm). 기본 3.0 — 고객 요구값으로 바꾸세요.")
+            Gh0 = shape_geom(SHAPE_HEX, W, W)
+            e_def = round(2 * (Gh0["h"] - spec_R * Gh0["kf"]), 2)
+            e_min = oc[1].number_input("고객 요구 맞꼭지 최소 e (mm)", value=float(e_def), min_value=0.0, step=0.01, key=f"t1_emin_{W:.3f}",
+                                       help=f"맞꼭지 = 마주 보는 꼭짓점 사이 거리. 샤프 육각이면 1.1547×W = {2 * Gh0['h']:.2f} mm. "
+                                            "기본값은 위 R 상한을 맞꼭지로 바꾼 값이니 고객 도면 값으로 바꾸세요.")
+        else:
+            spec_R = oc[0].number_input("고객 요구 모서리 R 상한 (mm)", value=1.5, min_value=0.05, step=0.1, key="t1_spec")
+        conf = oc[-2].slider("권장 선경 산출 신뢰도", 0.50, 0.99, 0.90, 0.01, key="t1_conf")
+        fm_default = fill_min_for((W + H) / 2.0, MODEL, shape_type)
+        fill_min_in = oc[-1].number_input("한 번 인발로 도달 가능한 최소 R (mm)", value=float(fm_default), min_value=0.0, step=0.05,
+                                          key=f"t1_fillmin_{shape_type}_{fm_default:.3f}",
+                                          help=("소재가 다이를 꽉 채워도 제품 모서리 R이 이 값 아래로는 잘 내려가지 않습니다. "
+                                                + (f"육각은 실측이 없어 사각 실측의 최소 꼭짓점 후퇴량(□≤20 {MODEL['fill_le20'] * KF_SQ:.2f} mm, □>20 {MODEL['fill_gt20'] * KF_SQ:.2f} mm)을 120° 모서리로 환산: "
+                                                   f"W≤20 {MODEL['fill_le20'] * KF_SQ / KF_HEX:.2f} mm, W>20 {MODEL['fill_gt20'] * KF_SQ / KF_HEX:.2f} mm."
+                                                   if is_hex else "실측 보정값: □≤20 0.83 mm, □>20 0.36 mm(불확실).")))
+    MODEL_T1 = {**MODEL, "fill_override": fill_min_in}
 
     # --- 단면적 / 감면율 (금형 기준) ---
     A1 = (np.pi / 4.0) * (d_in ** 2)
@@ -554,7 +584,15 @@ with tab1:
         A2_pred = G["A_sharp"] - G["loss"] * pred["rms"] ** 2
         diag_pred = 2 * G["h"] - 2 * pred["p50"] * G["kf"]
         p_spec = prob_R_le(spec_R, pred)
-        d_req = required_d0(shape_type, W, H, spec_R, conf, R, MODEL_T1)
+        spec_eff = spec_R
+        if is_hex:
+            # 맞꼭지 e = 2h − kf·(R_a + R_b) → 코너 하나당 허용 R 로 환산 (마주 보는 두 코너가 같다고 가정)
+            R_eq_e = (2 * G["h"] - e_min) / (2 * G["kf"])
+            spec_eff = min(spec_R, R_eq_e)
+            p_e = prob_R_le(R_eq_e, pred) if R_eq_e > 0 else 0.0
+            e_of = lambda r_: 2 * G["h"] - 2 * r_ * G["kf"]
+            e_p50, e_lo, e_hi = e_of(pred["p50"]), e_of(pred["p90"]), e_of(pred["p10"])
+        d_req = required_d0(shape_type, W, H, spec_eff, conf, R, MODEL_T1) if spec_eff > 0 else np.nan
         RA_req = (1 - A2 / (np.pi / 4 * d_req ** 2)) * 100 if np.isfinite(d_req) else np.nan
 
     prod_name = (f"□{W:.2f}" if abs(W - H) < 1e-9 else f"{W:.2f}×{H:.2f}") if shape_type == SHAPE_SQ else (f"HEX {W:.2f}" if shape_type == SHAPE_HEX else f"트랙 {W:.1f}×{H:.1f}")
@@ -562,27 +600,32 @@ with tab1:
 
     # ---------------- ① 결론 한 줄 ----------------
     if pred:
-        die_surface = 2 * (pred["h"] - R * pred["kf"])   # 다이스 모서리(대각) 지름
+        die_surface = 2 * (pred["h"] - R * pred["kf"])   # 다이스 모서리(대각/맞꼭지) 지름
         short = die_surface - d_in
-        if pred["p90"] <= spec_R and pred["p_fill"] >= 0.5:
+        diag_word = "맞꼭지(꼭짓점 사이)" if is_hex else "모서리 대각"
+        if pred["p90"] <= spec_eff and pred["p_fill"] >= 0.5:
             tone, tag = "v-green", "잘 채워짐 · 한 번 인발 한계 수준"
-        elif pred["p50"] <= spec_R:
+        elif pred["p50"] <= spec_eff:
             tone, tag = "v-amber", "경계 구간 · 코너마다 차이"
         else:
             tone, tag = "v-red", "모서리 미충전 · 자연 R"
-        why = (f"소재 Ø{d_in:.1f}이 다이스 모서리 대각 {die_surface:.2f} mm보다 <b>{short:.2f} mm 작아서</b>(모서리마다 {short / 2:.2f} mm) 모서리 끝까지 금속이 닿지 않습니다."
+        why = (f"소재 Ø{d_in:.1f}이 다이스 {diag_word} {die_surface:.2f} mm보다 <b>{short:.2f} mm 작아서</b>(모서리마다 {short / 2:.2f} mm) 모서리 끝까지 금속이 닿지 않습니다."
                if short > 0 else
-               f"소재 Ø{d_in:.1f}이 다이스 모서리 대각 {die_surface:.2f} mm보다 <b>{-short:.2f} mm 커서</b>(모서리마다 {-short / 2:.2f} mm) 모서리까지 금속이 채워집니다.")
+               f"소재 Ø{d_in:.1f}이 다이스 {diag_word} {die_surface:.2f} mm보다 <b>{-short:.2f} mm 커서</b>(모서리마다 {-short / 2:.2f} mm) 모서리까지 금속이 채워집니다.")
+        goal = f"목표 R ≤ {spec_R:.1f} mm" + (f" · 맞꼭지 e ≥ {e_min:.2f} mm" if is_hex else "")
         if np.isfinite(d_req):
-            todo = (f"목표 R ≤ {spec_R:.1f} mm (신뢰도 {conf:.0%}) → 소재 <b>Ø{d_req:.2f} 이상</b> 필요 (감면율 {RA_req:.1f}%)"
-                    if d_req > d_in + 0.005 else f"목표 R ≤ {spec_R:.1f} mm 충족 (신뢰도 {conf:.0%} 기준 최소 소재 Ø{d_req:.2f})")
+            todo = (f"{goal} (신뢰도 {conf:.0%}) → 소재 <b>Ø{d_req:.2f} 이상</b> 필요 (감면율 {RA_req:.1f}%)"
+                    if d_req > d_in + 0.005 else f"{goal} 충족 (신뢰도 {conf:.0%} 기준 최소 소재 Ø{d_req:.2f})")
         else:
-            todo = f"목표 R ≤ {spec_R:.1f} mm는 한 번 인발로 어렵습니다 (최소 도달 R 약 {pred['R_die']:.2f} mm)"
+            todo = f"{goal}는 한 번 인발로 어렵습니다 (최소 도달 R 약 {pred['R_die']:.2f} mm" + (
+                f" ↔ 맞꼭지 최대 약 {2 * pred['h'] - 2 * pred['R_die'] * pred['kf']:.2f} mm)" if is_hex else ")")
+        e_line = (f"<br><span class='v-range'>맞꼭지 e 약 <b>{e_p50:.2f} mm</b> (코너에 따라 {e_lo:.2f}–{e_hi:.2f} · 샤프 육각 {2 * pred['h']:.2f}) — "
+                  f"요구 ≥ {e_min:.2f} 만족 확률 {p_e * 100:.0f}% (코너 기준)</span>") if is_hex else ""
         st.markdown(f"""
 <div class="verdict {tone}">
   <div class="v-main"><span class="v-label">예상 모서리 R</span><span class="v-num">{pred['p50']:.1f}<small> mm</small></span>
        <span class="v-tag">{tag}</span></div>
-  <div class="v-sub">{why}<br><span class="v-range">코너마다 대략 {pred['p10']:.1f}–{pred['p90']:.1f} mm 사이로 나옵니다.</span></div>
+  <div class="v-sub">{why}<br><span class="v-range">코너마다 대략 {pred['p10']:.1f}–{pred['p90']:.1f} mm 사이로 나옵니다.</span>{e_line}</div>
   <div class="v-todo">{todo}</div>
 </div>""", unsafe_allow_html=True)
         # --- 감면율로 보는 모서리 상태 (자연 R ↔ 다이 R) ---
@@ -604,27 +647,35 @@ with tab1:
         else:
             msg = (f"현재 감면율 <b>{RA:.1f}%</b>면 <b>모서리까지 소재가 꽉 차서</b> 다이 R대로 나옵니다 "
                    f"(한 번 인발 한계 약 {pred['R_die']:.1f} mm).")
+        ra_note = (f"※ 육각은 다이 R이 없어도 꽉 차면 약 {pred['R_die']:.1f} mm로 나옵니다 — 120° 모서리는 꼭짓점이 {pred['R_die'] * pred['kf']:.2f} mm만 덜 차도 "
+                   f"R이 이만큼 됩니다(사각 실측의 한 번 인발 최소 후퇴량을 육각으로 환산). 맞꼭지로는 약 {2 * pred['h'] - 2 * pred['R_die'] * pred['kf']:.2f} mm."
+                   if is_hex else
+                   f"※ 다이 R이 약 {pred['R_die']:.1f} mm보다 작으면(0.3R·R 없음) 꽉 차도 약 {pred['R_die']:.1f} mm로 나옵니다 — 한 번 인발 한계(□19 실측).")
+        if is_hex:
+            msg = msg.replace("다이 R대로", f"최소 R(약 {pred['R_die']:.1f} mm)로").replace("자연 R과 다이 R 사이", "자연 R과 최소 R 사이")
         st.markdown(f"""
 <div class="ra-box">
   <div class="ra-title">감면율로 보는 모서리 상태</div>
   <div class="ra-track">
     <div class="z z-red" style="width:{pos(ra_k1):.1f}%"><span>자연 R · 모서리 미충전</span></div>
     <div class="z z-amber" style="width:{pos(ra_90) - pos(ra_k1):.1f}%"><span>경계</span></div>
-    <div class="z z-green" style="width:{100 - pos(ra_90):.1f}%"><span>꽉 참 · 다이 R</span></div>
+    <div class="z z-green" style="width:{100 - pos(ra_90):.1f}%"><span>꽉 참 · {'최소 R' if is_hex else '다이 R'}</span></div>
     <div class="ra-now" style="left:{pos(RA):.1f}%"><b>현재 {RA:.1f}%</b></div>
   </div>
   <div class="ra-ticks">
-    <span style="left:{pos(ra_k1):.1f}%">{ra_k1:.1f}%<br><small>소재 = 다이 대각 Ø{d_k1:.2f}</small></span>
+    <span style="left:{pos(ra_k1):.1f}%">{ra_k1:.1f}%<br><small>소재 = 다이 {'맞꼭지' if is_hex else '대각'} Ø{d_k1:.2f}</small></span>
     <span style="left:{pos(ra_90):.1f}%">{ra_90:.1f}%<br><small>꽉 참(90%) Ø{d_90:.2f}</small></span>
   </div>
   <div class="ra-msg">{msg}<br>
-    다이 R대로 나오려면 감면율 <b>{ra_k1:.1f}% 이상</b>(소재 Ø{d_k1:.2f} 이상)이어야 모서리에 소재가 닿기 시작하고,
+    {'모서리까지 채우려면' if is_hex else '다이 R대로 나오려면'} 감면율 <b>{ra_k1:.1f}% 이상</b>(소재 Ø{d_k1:.2f} 이상)이어야 모서리에 소재가 닿기 시작하고,
     안정적으로는 <b>{ra_90:.1f}% 이상</b>(Ø{d_90:.2f} 이상)이 필요합니다.
-    <span class="ra-note">※ 다이 R이 약 {pred['R_die']:.1f} mm보다 작으면(0.3R·R 없음) 꽉 차도 약 {pred['R_die']:.1f} mm로 나옵니다 — 한 번 인발 한계(□19 실측).</span>
+    <span class="ra-note">{ra_note}</span>
   </div>
 </div>""", unsafe_allow_html=True)
         if shape_type == SHAPE_HEX:
-            st.caption("육각은 실측이 없어 사각 실측으로 맞춘 모델을 그대로 적용한 추정값입니다.")
+            st.caption("육각 실측이 아직 없어, 사각 56코너로 맞춘 모델을 육각 기하(120° 모서리, 경계 감면율 17.3%)로 옮긴 추정값입니다. "
+                       "외부 육각 인발 실험(Rumiński 등 2025, Ø15.8·Ø16.8 → HEX14)의 모서리 미충전 면적과 비교하면 예측 2.5·1.1 % vs 실험 2.2·1.6 %로 비슷합니다(기본 보정 기준). "
+                       "육각 실측을 5번 탭 표에 넣고 재보정하면 정확해집니다.")
         elif abs(W - H) > 1e-6:
             st.caption("직사각은 정사각 실측으로 맞춘 모델의 근사값입니다.")
     elif shape_type == SHAPE_TR:
@@ -733,7 +784,7 @@ with tab1:
         vx, vy = corner_vertex(shape_type, W, H, 0)
         u = np.array([vx, vy]) / math.hypot(vx, vy)
         r50 = pred["p50"]
-        span = max(2.6, 1.7 * max(r50, pred["p90"] if show_band else r50) + 1.0)
+        span = max(2.6, 1.7 * math.tan(math.pi / n_c) * max(r50, pred["p90"] if show_band else r50) + 1.0)   # 원호가 변을 따라 R·tan(π/n)만큼 뻗음
         fz = go.Figure()
         fz.add_trace(go.Scatter(x=x_in, y=y_in, mode="lines", line=dict(color=ROD_C, dash="dash", width=2), hoverinfo="skip"))
         xp, yp = rounded_polygon(shape_type, W, H, r50, n_vis * 4)
@@ -807,21 +858,32 @@ with tab1:
         st.markdown("#### 숫자로 보기")
         d1, d2, d3, d4 = st.columns(4)
         d1.metric("예상 모서리 R (중앙값)", f"{pred['p50']:.2f} mm", f"코너별 {pred['p10']:.2f} – {pred['p90']:.2f} mm", delta_color="off")
-        d2.metric("모서리가 꽉 찰 확률", f"{pred['p_fill'] * 100:.0f} %", f"소재/다이 대각 비 {pred['k_ratio']:.3f}", delta_color="off")
-        d3.metric(f"R ≤ {spec_R:.1f} mm 만족 확률", f"{p_spec * 100:.0f} %", f"예측 실단면적 {A2_pred:.1f} mm²", delta_color="off")
+        d2.metric("모서리가 꽉 찰 확률", f"{pred['p_fill'] * 100:.0f} %", f"소재/다이 {'맞꼭지' if is_hex else '대각'} 비 {pred['k_ratio']:.3f}", delta_color="off")
+        if is_hex:
+            d3.metric(f"R ≤ {spec_R:.1f} · e ≥ {e_min:.2f} 만족", f"{prob_R_le(spec_eff, pred) * 100:.0f} %",
+                      f"R만 {p_spec * 100:.0f}% · 맞꼭지만 {p_e * 100:.0f}% (코너 기준)", delta_color="off")
+        else:
+            d3.metric(f"R ≤ {spec_R:.1f} mm 만족 확률", f"{p_spec * 100:.0f} %", f"예측 실단면적 {A2_pred:.1f} mm²", delta_color="off")
         if np.isfinite(d_req):
             d4.metric(f"권장 최소 소재 (신뢰도 {conf:.0%})", f"Ø {d_req:.2f}", f"감면율 {RA_req:.1f} % · 현재 대비 {d_req - d_in:+.2f}", delta_color="inverse")
         else:
-            d4.metric("권장 최소 소재", "산출 불가", f"목표 R이 최소 도달 R {pred['R_die']:.2f} 이하", delta_color="off")
+            d4.metric("권장 최소 소재", "산출 불가",
+                      (f"요구 맞꼭지가 한 번 인발 최대 약 {2 * pred['h'] - 2 * pred['R_die'] * pred['kf']:.2f}보다 큼"
+                       if is_hex and spec_eff < spec_R else f"목표 R이 최소 도달 R {pred['R_die']:.2f} 이하"), delta_color="off")
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("소재 단면적 A₁", f"{A1:.2f} mm²", f"Ø {d_in:.2f} mm", delta_color="off")
     c2.metric("제품 단면적 A₂ (다이 기준)", f"{A2:.2f} mm²", f"감면율 {RA:.2f} %", delta_color="off")
-    c3.metric("다이 대각 치수", f"{max_diag:.2f} mm", f"다이 {die_name}", delta_color="off")
+    c3.metric("다이 맞꼭지 치수" if is_hex else "다이 대각 치수", f"{max_diag:.2f} mm", f"다이 {die_name}", delta_color="off")
     if pred:
-        c4.metric("예상 제품 대각 치수", f"{diag_pred:.2f} mm", f"다이 대비 {diag_pred - max_diag:+.2f} mm", delta_color="off")
+        c4.metric("예상 제품 맞꼭지 e" if is_hex else "예상 제품 대각 치수", f"{diag_pred:.2f} mm",
+                  (f"다이 대비 {diag_pred - max_diag:+.2f} · e/W {diag_pred / W:.3f}" if is_hex else f"다이 대비 {diag_pred - max_diag:+.2f} mm"),
+                  delta_color="off")
     else:
         c4.metric("제품 대각 치수", f"{max_diag:.2f} mm", "트랙형", delta_color="off")
-    if pred:
+    if pred and is_hex:
+        st.caption(f"육각은 꼭짓점이 0.1 mm만 덜 차도 R이 {0.1 / pred['kf']:.2f} mm 커지지만(사각은 {0.1 / KF_SQ:.2f} mm), 맞꼭지 e는 R 1 mm당 {2 * pred['kf']:.2f} mm만 줄어듭니다. "
+                   "그래서 육각은 R 값이 커 보여도 맞꼭지 치수는 크게 줄지 않을 수 있으니 두 값을 함께 보세요.")
+    elif pred:
         st.caption(f"다이가 R 없음(샤프)이어도 한 번 인발로는 제품 모서리가 약 {pred['R_die']:.2f} mm보다 날카로워지기 어렵습니다 "
                    f"(□19 실측: 0.3R·R 없음 다이 모두 꽉 찬 조건에서 0.72–1.09 mm).")
 
@@ -844,11 +906,19 @@ with tab1:
 - **기존 식**: R_eff = 다이 R + 0.18·W·e^(-5.2·RA) = **{old:.2f} mm** (감면율에 거의 둔감 → 꽉 차는 조건은 과대, 덜 차는 조건은 과소 예측)
 - **최소 도달 R** = max(다이 R, 한 번 인발 최소 R) = **{pred['R_die']:.2f} mm** — 다이를 R 없음으로 만들어도 제품 모서리가 그만큼 날카로워지지는 않음
 - **코너 갭 모델 (실측 보정)**: 투입 소재 반경과 다이스 모서리(샤프 꼭짓점)의 차이 **g = h − d/2 = {pred['g']:+.3f} mm**가 지배인자
-  - 코너 후퇴량 e = e_die + w·ln(1+exp((g+ε+δ−e_die)/w)),  R = e / (1/cos(π/n) − 1)
+  - 꼭짓점 후퇴량 c = c_die + w·ln(1+exp((g+ε+δ−c_die)/w)),  R = c / (1/cos(π/n) − 1)  ({'육각 n=6 → R = 6.46·c' if is_hex else '사각 n=4 → R = 2.41·c'})
   - δ = {pred['delta']:.3f} mm (재료 유동에 의한 추가 코너 수축), w = {pred['w']:.3f} mm (전이 폭), σε = {pred['sigma']:.3f} mm (코너별 편차: 선재 공차·편심·다이 정렬)
-  - 덜 차는 구간에서 R은 갭 1 mm당 약 {1 / pred['kf']:.2f} mm 증가 (기하학적 기울기 — 실측 기울기 ≈2.3과 일치)
+  - 덜 차는 구간에서 R은 갭 1 mm당 약 {1 / pred['kf']:.2f} mm 증가 (기하학적 기울기{'' if is_hex else ' — 실측 기울기 ≈2.3과 일치'})
 - 강종(AISI1020/S20C/S45C/SS400) 효과는 실측 상 유의하지 않아 모델에서 제외
-""")
+""" + ("""
+**육각 적용 방법 (육각 실측 없음)**
+- 경계 감면율: 소재 = 다이 맞꼭지(1.1547·W)일 때 RA = 1 − 3√3/(2π) = **17.3 %** (사각 36.3 %). 육각은 원에 더 가까워 훨씬 낮은 감면율에서 모서리가 찹니다.
+- δ·w·σε는 사각 값을 그대로 쓰고, '한 번 인발 최소 R'은 **최소 꼭짓점 후퇴량이 형상과 같다**고 보고 환산 (사각 0.83 mm → 육각 2.22 mm, W ≤ 20).
+  R 값을 그대로 옮기는 방식(0.83 mm)은 외부 육각 실험(Ø16.8 조건)의 미충전 면적을 약 1/4로 과소 예측해 채택하지 않았습니다.
+- 외부 점검: Rumiński 등(2025) X6CrNiTi18-10 HEX14 — Ø15.8(RA 13.5 %) 미충전 2.21 % / Ø16.8(RA 23.5 %) 1.58 % ↔ 모델 2.45 % / 1.09 %.
+  같은 논문에서 RA 37.5 %(Ø18.6 → HEX14)는 인발 중 파단(스테인리스) → 육각에 사각만큼 큰 감면율은 필요하지 않음.
+- 맞꼭지 e = 2h − 2·0.155·R → R이 1 mm 커져도 e는 0.31 mm만 줄어듦.
+""" if is_hex else ""))
             st.dataframe(CV_TABLE, hide_index=True, **FW_DF)
 
     # ---------------- 3D ----------------
@@ -1005,7 +1075,7 @@ with tab2:
             use_R = cr2.checkbox("예측 모서리 R 반영 단면적", value=True, key="t2_useR",
                                  help="실측 보정 모델의 예상 R로 모서리 미충전 면적을 차감합니다 (끄면 기존 샤프 단면).")
             c_shape = st.number_input("형상 보정계수 C (기본 1.00 = 기존 엑셀식)", value=1.00, min_value=0.80, max_value=1.50, step=0.01,
-                                      key="t2_cshape", help="이형인발 잉여변형 보정용. 문헌상 원형 대비 증가 경향은 있으나 정량값 미공개 → 실측 인발하중으로 보정 후 사용 권장 (사각 1.05–1.15 범위 검토).")
+                                      key="t2_cshape", help="이형인발 잉여변형 보정용. 실측 인발하중으로 보정 후 사용 권장. 참고: Rumiński 등(2025)은 하중 계산에 사각 1.10, 육각 1.15의 형상계수를 사용 (사각 1.05–1.15 범위 검토).")
             Gt = shape_geom(shp, w_out_t2, w_out_t2)
             a2_sharp = Gt["A_sharp"]
             if d_in_t2 > 2 * Gt["h"] * 0.5:
@@ -1191,24 +1261,29 @@ def _nelder_mead(f, x0, steps, max_iter=3000, tol=1e-9):
 
 
 def fit_model(df_long, base):
-    """df_long: 열 [d0, a, R, (Rdes)] (정사각) → 최우도 재보정 (δ*, σε, 최소충전 R ≤20 / >20 ; w*·노이즈 고정)"""
-    d = df_long.dropna()
+    """df_long: 열 [d0, a, R, (Rdes), (shape)] → 최우도 재보정 (δ*, σε, 최소충전 R(사각 기준) ≤20 / >20 ; w*·노이즈 고정)
+    육각 행: a = 대면 W, 사각과 같은 '최소 꼭짓점 후퇴량'을 공유 (R 환산 ×kf_sq/kf_hex)"""
+    d = df_long.dropna(subset=["d0", "a", "R"])
     d = d[(d["R"] > 0) & (d["a"] > 0) & (d["d0"] > 0)]
-    a = d["a"].to_numpy(float); g = a / SQRT2 - d["d0"].to_numpy(float) / 2.0; y = d["R"].to_numpy(float)
-    rdes = d["Rdes"].to_numpy(float) if "Rdes" in d else np.full(len(a), DEFAULT_DIE_R)
+    a = d["a"].to_numpy(float); y = d["R"].to_numpy(float)
+    hexm = (d["shape"] == SHAPE_HEX).to_numpy() if "shape" in d else np.zeros(len(a), bool)
+    kf = np.where(hexm, KF_HEX, KF_SQ)
+    g = np.where(hexm, a / SQRT3, a / SQRT2) - d["d0"].to_numpy(float) / 2.0
+    rdes = d["Rdes"].fillna(DEFAULT_DIE_R).to_numpy(float) if "Rdes" in d else np.full(len(a), DEFAULT_DIE_R)
     cls = (a > 20.0 + 1e-9)
-    kf, sn, w = SQRT2 - 1.0, base["noise"], base["w_star"]
+    sn, w = base["noise"], base["w_star"]
     pri = [math.log(MODEL_DEFAULT["fill_le20"]), math.log(MODEL_DEFAULT["fill_gt20"])]
     Wd = (w * a)[:, None]
+    kfc = kf[:, None]
 
     def nll(p):
         ds, s = p[0], math.exp(p[1])
         if not (-0.1 < ds < 0.2 and 0.02 < s < 1.5):
             return 1e12
         f0, f1 = math.exp(p[2]), math.exp(p[3])
-        ed = (np.maximum(rdes, np.where(cls, f1, f0)) * kf)[:, None]
+        ed = np.maximum(rdes * kf, np.where(cls, f1, f0) * KF_SQ)[:, None]   # 다이 R 후퇴량 vs 최소 후퇴량
         x = g[:, None] + s * Z_GRID[None, :]
-        Rn = (ed + Wd * np.logaddexp(0.0, (x + ds * a[:, None] - ed) / Wd)) / kf
+        Rn = (ed + Wd * np.logaddexp(0.0, (x + ds * a[:, None] - ed) / Wd)) / kfc
         lik = (np.exp(-0.5 * ((y[:, None] - Rn) / sn) ** 2) / (sn * math.sqrt(2 * math.pi)) * PZ[None, :]).sum(1) + 1e-300
         pen = 0.5 * ((p[2] - pri[0]) / 0.5) ** 2 + 0.5 * ((p[3] - pri[1]) / 0.5) ** 2
         return float(-np.log(lik).sum() + pen)
@@ -1220,7 +1295,14 @@ def fit_model(df_long, base):
         best, fb = _nelder_mead(nll, best, [s * 0.5 for s in steps])
     newm = {**base, "delta_star": float(best[0]), "sigma": float(math.exp(best[1])),
             "fill_le20": float(math.exp(best[2])), "fill_gt20": float(math.exp(best[3]))}
-    return newm, fb, len(y)
+    return newm, fb, len(y), int(hexm.sum())
+
+
+# 외부 육각 인발 실험 (Rumiński, Skubisz, Micek 2025, J. Min. Metall. B 61(2) 233–248, X6CrNiTi18-10, Table 1·4)
+HEX_EXT = [
+    dict(id="H3", d0=15.8, A_th=169.42, A_act=165.68),
+    dict(id="H2", d0=16.8, A_th=169.42, A_act=166.74),
+]
 
 
 with tab5:
@@ -1243,27 +1325,32 @@ with tab5:
     st.dataframe(db_df, hide_index=True, **FW_DF)
     st.download_button("실측 DB CSV 다운로드", db_df.to_csv(index=False).encode("utf-8-sig"), "실측R_DB.csv", "text/csv")
 
-    g1, g2 = st.columns([1.3, 1])
     # 감면율-R 산점도 + 모델 곡선
+    curve_shape = st.radio("곡선 형상", ["사각 □20", "육각 HEX19"], horizontal=True, key="t5_curve",
+                           help="육각은 실측이 없어 모델 곡선만 표시합니다 (사각 실측 기반 환산).")
+    c_hex = curve_shape.startswith("육각")
+    g1, g2 = st.columns([1.3, 1])
     fig_ra = go.Figure()
-    ra_grid = np.linspace(0.26, 0.46, 120)
-    a_ref, Rd_ref = 20.0, DEFAULT_DIE_R
+    shp_c, a_ref, Rd_ref = (SHAPE_HEX, 19.0, DEFAULT_DIE_R) if c_hex else (SHAPE_SQ, 20.0, DEFAULT_DIE_R)
+    A_ref = shape_geom(shp_c, a_ref, a_ref)["A_sharp"]
+    ra_grid = np.linspace(0.08, 0.32, 120) if c_hex else np.linspace(0.26, 0.46, 120)
     q = {"p10": [], "p50": [], "p90": []}
     for r_ in ra_grid:
-        d0g = math.sqrt(a_ref ** 2 / (np.pi / 4 * (1 - r_)))
-        pr = predict_R(SHAPE_SQ, a_ref, a_ref, d0g, Rd_ref, MODEL)
+        d0g = math.sqrt(A_ref / (np.pi / 4 * (1 - r_)))
+        pr = predict_R(shp_c, a_ref, a_ref, d0g, Rd_ref, MODEL)
         for kq in q:
             q[kq].append(pr[kq])
     fig_ra.add_trace(go.Scatter(x=ra_grid * 100, y=q["p90"], mode="lines", line=dict(width=0), showlegend=False, hoverinfo="skip"))
     fig_ra.add_trace(go.Scatter(x=ra_grid * 100, y=q["p10"], mode="lines", line=dict(width=0), fill="tonexty",
-                                fillcolor="rgba(201,146,46,0.28)", name="예측 P10~P90 (□20, 다이 R 없음)"))
+                                fillcolor="rgba(201,146,46,0.28)", name=f"예측 P10~P90 ({'HEX19' if c_hex else '□20'}, 다이 R 없음)"))
     fig_ra.add_trace(go.Scatter(x=ra_grid * 100, y=q["p50"], mode="lines", line=dict(color=TEMPER_BLUE, width=3), name="예측 P50"))
-    fig_ra.add_trace(go.Scatter(x=ra_grid * 100, y=[old_model_R(20, r_, 1.0) for r_ in ra_grid], mode="lines",
-                                line=dict(color="#8A949D", dash="dash", width=2), name="기존식 (다이스R 1.0)"))
+    if not c_hex:
+        fig_ra.add_trace(go.Scatter(x=ra_grid * 100, y=[old_model_R(20, r_, 1.0) for r_ in ra_grid], mode="lines",
+                                    line=dict(color="#8A949D", dash="dash", width=2), name="기존식 (다이스R 1.0)"))
     gcolor = {"AISI1020": OXIDE_GREEN, "S20C": "#6A5AA8", "S45C": SCALE_RED, "SS400": "#8A6A1F"}
     rng = np.random.default_rng(1)
     shown = set()
-    for m in MEASURED_DB:
+    for m in ([] if c_hex else MEASURED_DB):
         ra = (1 - m["a"] ** 2 / (np.pi / 4 * m["d0"] ** 2)) * 100
         jit = rng.uniform(-0.35, 0.35)
         fig_ra.add_trace(go.Scatter(x=[ra + jit] * 4, y=m["R"], mode="markers",
@@ -1271,9 +1358,14 @@ with tab5:
                                     name=m["grade"], legendgroup=m["grade"], showlegend=m["grade"] not in shown,
                                     hovertemplate=f"{m['id']} ({m['d0']:.0f}→{m['a']})<br>R %{{y:.3f}}<extra></extra>"))
         shown.add(m["grade"])
-    fig_ra.add_vline(x=(1 - 2 / np.pi) * 100, line=dict(color=INK, dash="dot"),
-                     annotation_text="선경 = 대각 (RA 36.3%)", annotation_position="top")
-    fig_ra.update_layout(title="감면율과 모서리 R — 실측 56코너 · 모델", xaxis_title="감면율 RA (%)", yaxis_title="모서리 R (mm)",
+    if c_hex:
+        fig_ra.add_vline(x=(1 - 3 * SQRT3 / (2 * np.pi)) * 100, line=dict(color=INK, dash="dot"),
+                         annotation_text="선경 = 맞꼭지 (RA 17.3%)", annotation_position="top")
+    else:
+        fig_ra.add_vline(x=(1 - 2 / np.pi) * 100, line=dict(color=INK, dash="dot"),
+                         annotation_text="선경 = 대각 (RA 36.3%)", annotation_position="top")
+    fig_ra.update_layout(title=("감면율과 모서리 R — 육각 모델 (실측 없음)" if c_hex else "감면율과 모서리 R — 실측 56코너 · 모델"),
+                         xaxis_title="감면율 RA (%)", yaxis_title="모서리 R (mm)",
                          height=470, plot_bgcolor=PANEL, paper_bgcolor="rgba(0,0,0,0)",
                          legend=dict(orientation="h", y=-0.2, font=dict(size=11)), margin=dict(t=50, l=10, r=10))
     style_fig(fig_ra); fig_ra.update_layout(legend=dict(y=-0.2))
@@ -1300,31 +1392,62 @@ with tab5:
 - 미충전 구간 실측 기울기 ≈ 2.3 mm/mm ↔ 기하학적 기울기 1/(√2−1) = 2.41 → 모델 구조가 물리적으로 타당.
 - **실제 다이 R 확인 결과**: 8로트 중 2로트만 0.3R(LE005, LD031), 나머지는 R 없음(샤프). □19는 0.3R·R 없음 다이 모두 꽉 찬 조건에서 0.72–1.09 → 한 번 인발로는 **약 0.83 mm 아래로 날카로워지지 않음**. □22(R 없음)는 편심 bar 한쪽 코너에서 0.42–0.60이 관측됨.
 - 강종 차이는 bar 간 편차에 묻혀 유의하지 않음 · 한 bar 안의 코너 편차(SD 0.3–0.9 mm)가 bar 간 편차보다 큼 → **선재 편심/진원도·다이스 정렬** 관리가 R 균일성의 핵심.
+- **육각**: 경계 감면율 **17.3 % (선경 = 맞꼭지)**. 사내 실측이 없어 δ·σε는 사각 값을 쓰고, 한 번 인발 최소 R은 같은 최소 꼭짓점 후퇴량으로 환산(□≤20 0.83 → HEX 2.22 mm).
 """)
 
+    st.markdown("#### 육각 — 외부 실험으로 점검 (사내 실측 없음)")
+    ext_rows = []
+    loss_hex = 2 * SQRT3 - math.pi
+    for ex in HEX_EXT:
+        Wx = math.sqrt(ex["A_th"] / (SQRT3 / 2.0))
+        prx = predict_R(SHAPE_HEX, Wx, Wx, ex["d0"], 0.0, MODEL)
+        ext_rows.append({
+            "시편": ex["id"], "조건": f"Ø{ex['d0']:.1f} → HEX{Wx:.1f}",
+            "RA(%)": round((1 - ex["A_th"] / (np.pi / 4 * ex["d0"] ** 2)) * 100, 1), "갭 g(mm)": round(prx["g"], 2),
+            "실험 미충전(%)": round((ex["A_th"] - ex["A_act"]) / ex["A_th"] * 100, 2),
+            "모델 미충전(%)": round(loss_hex * (prx["rms"] ** 2 + MODEL["noise"] ** 2) / ex["A_th"] * 100, 2),
+            "실험 환산 R(mm)": round(math.sqrt((ex["A_th"] - ex["A_act"]) / loss_hex), 2),
+            "모델 R P50 (P10~P90)": f"{prx['p50']:.2f} ({prx['p10']:.2f}~{prx['p90']:.2f})",
+        })
+    st.dataframe(pd.DataFrame(ext_rows), hide_index=True, **FW_DF)
+    st.caption("출처: Rumiński·Skubisz·Micek (2025) J. Min. Metall. Sect. B 61(2) 233–248, 스테인리스 X6CrNiTi18-10 · Table 1·4. "
+               "미충전 = 이론 단면적 − 실제 단면적. 환산 R = 미충전이 모두 6개 모서리 R에서 생겼다고 볼 때의 R(대면 치수 오차도 섞여 있어 참고용). "
+               "같은 논문에서 Ø18.6(RA 37.5 %)은 인발 중 파단.")
+
     st.markdown("---")
-    st.markdown("#### 측정값 추가와 재보정 (정사각)")
-    base_rows = [{"제조번호": m["id"], "강종": m["grade"], "투입선경 d0": m["d0"], "제품 a": m["a"], "다이스": m["die"],
+    st.markdown("#### 측정값 추가와 재보정 (사각 · 육각)")
+    A_COL = "제품 a (사각 한변·육각 대면)"
+    base_rows = [{"제조번호": m["id"], "강종": m["grade"], "형상": "사각", "투입선경 d0": m["d0"], A_COL: m["a"], "다이스": m["die"],
                   "다이스 모서리R": m["die_r"],
-                  "R1": m["R"][0], "R2": m["R"][1], "R3": m["R"][2], "R4": m["R"][3]} for m in MEASURED_DB]
-    edit_df = st.data_editor(pd.DataFrame(base_rows), num_rows="dynamic", key="t5_editor", **FW_ED)
+                  "R1": m["R"][0], "R2": m["R"][1], "R3": m["R"][2], "R4": m["R"][3], "R5": None, "R6": None} for m in MEASURED_DB]
+    st.caption("육각은 형상을 '육각'으로 고르고 R1–R6 (6코너)을 넣으세요. 사각은 R1–R4만 씁니다. 표 맨 아래 빈 줄을 눌러 행을 추가합니다.")
+    edit_df = st.data_editor(
+        pd.DataFrame(base_rows), num_rows="dynamic", key="t5_editor2",
+        column_config={
+            "형상": st.column_config.SelectboxColumn("형상", options=["사각", "육각"], default="사각", required=True),
+            "R5": st.column_config.NumberColumn("R5", help="육각만", format="%.3f"),
+            "R6": st.column_config.NumberColumn("R6", help="육각만", format="%.3f"),
+        }, **FW_ED)
     b1, b2, b3 = st.columns([1, 1, 2])
     if b1.button("입력 데이터로 모델 재보정", type="primary"):
         long = []
         for _, r in edit_df.iterrows():
-            for c in ["R1", "R2", "R3", "R4"]:
+            is_h = str(r.get("형상", "사각")).startswith("육")
+            for c in (["R1", "R2", "R3", "R4", "R5", "R6"] if is_h else ["R1", "R2", "R3", "R4"]):
                 try:
                     rdes = r.get("다이스 모서리R")
                     rdes = float(rdes) if rdes is not None and not pd.isna(rdes) else DEFAULT_DIE_R
-                    long.append(dict(d0=float(r["투입선경 d0"]), a=float(r["제품 a"]), Rdes=rdes, R=float(r[c])))
+                    long.append(dict(d0=float(r["투입선경 d0"]), a=float(r[A_COL]), Rdes=rdes, R=float(r[c]),
+                                     shape=SHAPE_HEX if is_h else SHAPE_SQ))
                 except (TypeError, ValueError):
                     pass
-        if len(long) < 12:
+        long_df = pd.DataFrame(long).dropna(subset=["d0", "a", "R"]) if long else pd.DataFrame()
+        if len(long_df) < 12:
             st.error("코너 데이터가 12개 이상 필요합니다.")
         else:
             with st.spinner("최우도 재보정 중..."):
-                newm, fb, nobs = fit_model(pd.DataFrame(long), dict(MODEL_DEFAULT))
-            newm["source"] = f"사용자 재보정 ({nobs}코너)"
+                newm, fb, nobs, nhex = fit_model(long_df, dict(MODEL_DEFAULT))
+            newm["source"] = f"사용자 재보정 ({nobs}코너" + (f" · 육각 {nhex}코너 포함" if nhex else "") + ")"
             st.session_state["model"] = newm
             st.rerun()
     if b2.button("기본 보정값 복원"):
@@ -1332,5 +1455,8 @@ with tab5:
         st.rerun()
     b3.markdown(f"**현재 모델:** {MODEL.get('source', '')}  \n"
                 f"δ* = {MODEL['delta_star']:.4f} · w* = {MODEL['w_star']:.4f} · σε = {MODEL['sigma']:.3f} mm  \n"
-                f"한 번 인발 최소 도달 R: □≤20 {MODEL['fill_le20']:.2f} mm · □>20 {MODEL['fill_gt20']:.2f} mm (다이 R 0.3R/R 없음 실측 기준)")
-    st.caption("※ 실제 투입 선재 직경(실측)·다이스 도면 R을 함께 기록하면 예측 정확도가 가장 크게 개선됩니다. 육각 실측은 별도 형상 파라미터 보정이 필요합니다.")
+                f"한 번 인발 최소 도달 R: □≤20 {MODEL['fill_le20']:.2f} · □>20 {MODEL['fill_gt20']:.2f} mm "
+                f"(육각 환산 W≤20 {MODEL['fill_le20'] * KF_SQ / KF_HEX:.2f} · W>20 {MODEL['fill_gt20'] * KF_SQ / KF_HEX:.2f} mm)")
+    st.caption("※ 실제 투입 선재 직경(실측)·다이스 도면 R을 함께 기록하면 예측 정확도가 가장 크게 개선됩니다. "
+               "육각 실측을 넣고 재보정하면 사각·육각이 같은 '최소 꼭짓점 후퇴량'을 공유하는 조건으로 함께 맞춥니다. "
+               "재보정 결과는 이 화면을 새로고침하면 기본값으로 돌아갑니다.")
