@@ -210,6 +210,21 @@ FW_CHART = _full_width_kw(st.plotly_chart)
 FW_DF = _full_width_kw(st.dataframe)
 FW_ED = _full_width_kw(st.data_editor)
 SHAPE_HEX, SHAPE_SQ, SHAPE_TR = "정육각형", "사각형 (정/직사각)", "이형 (트랙/장원형)"
+FEM_COLORS = ["#1A1AD2", "#1F55FF", "#1E90FF", "#14C8F0", "#12E0B4", "#2FD95A", "#8FE32A", "#E3E61C", "#FFC41A", "#FF8C14", "#F24E10", "#C8140C"]
+
+
+def fem_scale(banded=True):
+    """FEM 결과처럼 파랑(낮음) → 초록 → 노랑 → 빨강(높음) 12단계"""
+    n = len(FEM_COLORS)
+    if not banded:
+        return [[i / (n - 1), c] for i, c in enumerate(FEM_COLORS)]
+    cs = []
+    for i, c in enumerate(FEM_COLORS):
+        cs += [[i / n, c], [(i + 1) / n, c]]
+    return cs
+
+
+CS_STRAIN = CS_TEMP = fem_scale(True)
 
 # ==========================================
 # 실측 R DB  (사각 봉강 이형 형상측정, 비전측정기 원호피팅 R, 2026.09~10)
@@ -481,6 +496,219 @@ def match_db(d0, W, H, tol_d=0.3, tol_a=0.08):
     if abs(W - H) > 1e-6:
         return []
     return [r for r in MEASURED_DB if abs(r["d0"] - d0) <= tol_d and abs(r["a"] - W) <= tol_a]
+
+
+# ==========================================
+# 변형·온도 간이 해석 (AFDEX 같은 FEM 대신, 즉시 계산되는 근사)
+#  1) 형상 변화: 원형 단면 → 제품 단면을 '면적 비율이 같은 부채꼴끼리' 대응시키는 운동학적 매핑
+#     (표면일수록 제품 형상, 중심일수록 균일 축소) → 최종 변형 기울기의 유효 변형률
+#  2) 표면 전단(잉여변형): Δ = (α/r)(1+√(1−r))², Φ = 0.8 + Δ/4.4 (Hosford–Caddell),
+#     반경에 비례·다이가 깊게 누르는 방향일수록 크게 배분
+#  3) 온도: 소성일의 90 %가 열 (Hollomon 경화, TS로 K 추정) + 다이 마찰열(접촉 길이·시간, 반무한체 표면 가열)
+# ==========================================
+RHO_C_STEEL, K_TH_STEEL, BETA_HEAT, ETA_FRIC = 7850.0 * 460.0, 45.0, 0.9, 0.35   # 마찰열 35 %가 소재로 (외부 FEM·실측과 맞춤)
+KAPPA_STEEL = K_TH_STEEL / RHO_C_STEEL
+
+
+def _ierfc(x):
+    erfc = 2.0 * (1.0 - ncdf_vec(np.asarray(x) * SQRT2))
+    return np.exp(-np.asarray(x) ** 2) / math.sqrt(math.pi) - x * erfc
+
+
+def _section_boundary(shape, W, H, r):
+    if shape == SHAPE_TR:
+        return track_points(W, H, 1440)
+    return rounded_polygon(shape, W, H, r, 1440)
+
+
+@st.cache_data(show_spinner=False, max_entries=64)
+def deform_fields(shape, W, H, r_prod, r_die, d0, two_alpha=30.0, v_mpm=20.0, mu=0.05, ts_kgf=55.0, bearing=6.0,
+                  n_h=0.18, T0=25.0, ngrid=111, M=720):
+    phi_g = np.linspace(0, 2 * np.pi, M, endpoint=False)
+    xb, yb = _section_boundary(shape, W, H, r_prod)
+    xr, yr = resample_polar(xb, yb, M)
+    rho_o = np.hypot(xr, yr)
+    xd, yd = _section_boundary(shape, W, H, r_die)
+    xdr, ydr = resample_polar(xd, yd, M)
+    rho_d = np.hypot(xdr, ydr)
+    A_out = 0.5 * abs(np.dot(xb, np.roll(yb, -1)) - np.dot(yb, np.roll(xb, -1)))
+    R0 = d0 / 2.0
+    lam = math.pi * R0 ** 2 / A_out
+    if lam <= 1.0 + 1e-6:
+        return None
+    eps_h = math.log(lam)
+    R_eq = math.sqrt(A_out / math.pi)
+    dA = 0.5 * rho_o ** 2 * (2 * np.pi / M)
+    phi_e = np.r_[phi_g, 2 * np.pi]
+    th_e = 2 * np.pi * np.r_[0.0, np.cumsum(dA)] / dA.sum()
+    rho_e = np.r_[rho_o, rho_o[0]]
+
+    def rho_of(phi):
+        return np.interp(np.mod(phi, 2 * np.pi), phi_e, rho_e)
+
+    def th_of(phi):
+        pm = np.mod(phi, 2 * np.pi)
+        return np.interp(pm, phi_e, th_e) + (phi - pm)
+
+    def out_xy(s_, phi):
+        rr = s_ * ((1 - s_ ** 2) * R_eq + s_ ** 2 * rho_of(phi))
+        return rr * np.cos(phi), rr * np.sin(phi)
+
+    def in_xy(s_, phi):
+        th = phi + s_ ** 2 * (th_of(phi) - phi)
+        return s_ * R0 * np.cos(th), s_ * R0 * np.sin(th)
+
+    TS = ts_kgf * 9.80665
+    Kh = TS * (math.e / n_h) ** n_h
+    Wp = lambda e: Kh * np.power(np.maximum(e, 1e-9), n_h + 1) / (n_h + 1)   # 소성일 (MJ/m³)
+    a = math.radians(two_alpha / 2.0)
+    r_ = 1 - 1 / lam
+    Delta = (a / r_) * (1 + math.sqrt(1 - r_)) ** 2
+    Phi = max(1.0, 0.8 + Delta / 4.4)
+    drho = R0 - rho_o
+    g_raw = np.clip(drho / max(drho.max(), 1e-9), 0.0, 1.0)
+    kw = max(1, int(M * 8 / 360))                               # ±8° 원형 이동평균 (전단은 둘레로 퍼짐)
+    g_sm = np.convolve(np.r_[g_raw[-kw:], g_raw, g_raw[:kw]], np.ones(2 * kw + 1) / (2 * kw + 1), mode="valid")
+    g_e = np.r_[g_sm, g_sm[0]]
+    g_mean = float(g_sm.mean())
+    c_red = (Phi - 1.0) * eps_h * 1.5            # 단면 평균 (Φ−1)·ε 이 되도록 표면(s=1) 값 설정
+
+    def strain(s_, phi):
+        s_ = np.maximum(s_, 0.03)
+        hs = hp = 1e-4
+        o1 = out_xy(s_ + hs, phi); o0 = out_xy(s_ - hs, phi); o3 = out_xy(s_, phi + hp); o2 = out_xy(s_, phi - hp)
+        i1 = in_xy(s_ + hs, phi); i0 = in_xy(s_ - hs, phi); i3 = in_xy(s_, phi + hp); i2 = in_xy(s_, phi - hp)
+        A11, A21 = (o1[0] - o0[0]) / (2 * hs), (o1[1] - o0[1]) / (2 * hs)
+        A12, A22 = (o3[0] - o2[0]) / (2 * hp), (o3[1] - o2[1]) / (2 * hp)
+        B11, B21 = (i1[0] - i0[0]) / (2 * hs), (i1[1] - i0[1]) / (2 * hs)
+        B12, B22 = (i3[0] - i2[0]) / (2 * hp), (i3[1] - i2[1]) / (2 * hp)
+        dB = B11 * B22 - B12 * B21
+        F11 = (A11 * B22 - A12 * B21) / dB; F12 = (-A11 * B12 + A12 * B11) / dB
+        F21 = (A21 * B22 - A22 * B21) / dB; F22 = (-A21 * B12 + A22 * B11) / dB
+        S1 = F11 ** 2 + F12 ** 2 + F21 ** 2 + F22 ** 2
+        D = np.abs(F11 * F22 - F12 * F21)
+        disc = np.sqrt(np.maximum(S1 ** 2 - 4 * D ** 2, 0))
+        sg1 = np.sqrt((S1 + disc) / 2); sg2 = np.sqrt(np.maximum((S1 - disc) / 2, 1e-12))
+        nrm = np.sqrt(sg1 * sg2 * lam)                      # 비압축 보정 (축 방향 연신 λ 균일)
+        e1, e2 = np.log(sg1 / nrm), np.log(sg2 / nrm)
+        e_shape = np.sqrt(2.0 / 3.0 * (e1 ** 2 + e2 ** 2 + math.log(lam) ** 2))
+        g_loc = np.interp(np.mod(phi, 2 * np.pi), phi_e, g_e)
+        e_red = c_red * s_ * (g_mean + (g_loc - g_mean) * s_ ** 2)   # 안쪽일수록 둘레 방향 차이가 흐려짐
+        return e_shape, e_red
+
+    Lm = rho_o.max() * 1.04
+    xs = np.linspace(-Lm, Lm, ngrid)
+    X, Y = np.meshgrid(xs, xs)
+    PH = np.mod(np.arctan2(Y, X), 2 * np.pi)
+    RH = np.hypot(X, Y)
+    RB = rho_of(PH)
+    inside = RH <= RB
+    lo, hi = np.zeros_like(RH), np.ones_like(RH)
+    for _ in range(40):
+        mid = 0.5 * (lo + hi)
+        fm = mid * ((1 - mid ** 2) * R_eq + mid ** 2 * RB) - RH
+        hi = np.where(fm > 0, mid, hi); lo = np.where(fm > 0, lo, mid)
+    S_ = 0.5 * (lo + hi)
+    e_sh, e_rd = strain(S_, PH)
+    EPS = e_sh + e_rd
+    dT_p = BETA_HEAT * Wp(EPS) * 1e6 / RHO_C_STEEL
+    es_sh, es_rd = strain(np.ones_like(phi_g), phi_g)
+    eps_surf = es_sh + es_rd
+    sig_bar = Wp(eps_surf) / np.maximum(eps_surf, 1e-9)    # 표면 평균 유동응력 (MPa)
+    p_die = 0.8 * sig_bar                                   # 다이 면압 ≈ 0.8 × 유동응력 (근사)
+    v_out = v_mpm / 60.0
+    v_cone = v_out * (1 + 1 / lam) / 2
+    Lc = np.maximum(drho, 0.0) / math.sin(a) * 1e-3          # 어프로치 접촉 길이 (m)
+    touch = (rho_d - rho_o) < 0.03                           # 베어링에 닿는 둘레 (모서리 미충전부는 안 닿음)
+    Lb = np.where(touch, bearing * 1e-3, 0.0)
+    E = ETA_FRIC * mu * p_die * 1e6 * (Lc + Lb)              # 소재로 들어가는 마찰열 (J/m²)
+    t_c = np.maximum(Lc / v_cone + Lb / v_out, 1e-6)
+    dT_fs = np.where(Lc + Lb > 0, 2 * E / (math.sqrt(math.pi * K_TH_STEEL * RHO_C_STEEL) * np.sqrt(t_c)), 0.0)
+    dT_fs_g = np.interp(PH, phi_e, np.r_[dT_fs, dT_fs[0]])
+    t_g = np.interp(PH, phi_e, np.r_[t_c, t_c[0]])
+    z = np.maximum(RB - RH, 0) * 1e-3
+    dT_f = dT_fs_g * math.sqrt(math.pi) * _ierfc(z / (2 * np.sqrt(KAPPA_STEEL * t_g)))
+    T = T0 + dT_p + dT_f
+    # 유효응력(가공경화 후 강도): Swift σ = K(ε0+ε)ⁿ, 투입재 항복 ≈ 0.65·TS
+    eps0 = (0.65 * TS / Kh) ** (1.0 / n_h)
+    sig_f = lambda e: Kh * np.power(eps0 + np.maximum(e, 0.0), n_h)
+    SIG = sig_f(EPS)
+    EPS = np.where(inside, EPS, np.nan); T = np.where(inside, T, np.nan); SIG = np.where(inside, SIG, np.nan)
+    T_surf = T0 + BETA_HEAT * Wp(eps_surf) * 1e6 / RHO_C_STEEL + dT_fs
+    c = ngrid // 2
+    eps_axis = float(e_sh[c, c] + e_rd[c, c])
+    T_axis = float(T0 + BETA_HEAT * Wp(eps_axis) * 1e6 / RHO_C_STEEL)
+
+    # --- 다이 면압: Sachs 슬래브법 (축 방향 인발응력 σx 누적) + 둘레별 접촉 시작 위치 ---
+    ta = math.tan(a)
+    pen_d = np.maximum(R0 - rho_d, 0.0)                         # 다이가 원형 소재를 누르는 깊이 (각도별)
+    L_ap = max(float(pen_d.max()) / ta, 1e-3)                  # 어프로치 접촉 길이 (가장 깊게 누르는 곳 기준)
+    nxa = 80
+    xa = np.linspace(0.0, L_ap, nxa)
+    r_die_x = rho_d[None, :] + (L_ap - xa[:, None]) * ta
+    r_mat = np.minimum(R0, r_die_x)
+    A_x = 0.5 * (r_mat ** 2).sum(1) * (2 * np.pi / M)
+    eh_x = np.log(math.pi * R0 ** 2 / A_x)
+    Bf = mu / ta
+    sx = np.zeros(nxa)
+    for i in range(1, nxa):
+        de = eh_x[i] - eh_x[i - 1]
+        sf_mid = float(sig_f(0.5 * (eh_x[i] + eh_x[i - 1]) * Phi))
+        sx[i] = sx[i - 1] + ((1 + Bf) * sf_mid - Bf * sx[i - 1]) * de
+    sf_x = sig_f(eh_x * Phi)
+    contact = r_die_x <= R0 + 1e-9
+    P_ap = np.where(contact, np.maximum(sf_x - sx, 0.0)[:, None], 0.0)
+    nxb = 12 if bearing > 0 else 0
+    xb_ = np.linspace(L_ap, L_ap + bearing, nxb + 1)[1:] if nxb else np.zeros(0)
+    p_bear = 0.5 * max(float(sf_x[-1] - sx[-1]), 0.0)
+    P_b = np.where(touch[None, :], p_bear, 0.0) * np.ones((nxb, 1))
+    die_x = np.r_[xa, xb_]
+    die_P = np.vstack([P_ap, P_b]) if nxb else P_ap
+    return dict(x=xs, eps=EPS, T=T, sig=SIG, inside=inside, dx=float(xs[1] - xs[0]), phi=phi_g, rho=rho_o,
+                eps_surf=eps_surf, T_surf=T_surf, dT_fs=dT_fs, sig_surf=sig_f(eps_surf), sig0=float(sig_f(0.0)),
+                eps_h=eps_h, lam=lam, Delta=Delta, Phi=Phi, eps_axis=eps_axis, T_axis=T_axis, sig_axis=float(sig_f(eps_axis)),
+                eps_mean=float(np.nanmean(EPS)), T_mean=float(np.nanmean(T)), depth_mm=float(np.sqrt(KAPPA_STEEL * t_c.max()) * 1e3),
+                t_contact=float(t_c.max()), p_die=float(p_die.max()), K=Kh, n=n_h, eps0=eps0,
+                die_x=die_x, die_P=die_P, L_ap=L_ap, sig_draw=float(sx[-1]), sf_exit=float(sf_x[-1]))
+
+
+@st.cache_data(show_spinner=False, max_entries=64)
+def cool_down(T, inside, dx_mm, t_s):
+    """출구 후 t초 동안 단면 안 열전도 (공기 냉각 무시, 2차원 양해법)"""
+    if t_s <= 0:
+        return T
+    k = KAPPA_STEEL * 1e6                                        # mm²/s
+    dt = 0.24 * dx_mm ** 2 / k
+    nstep = int(math.ceil(t_s / dt)); dt = t_s / nstep
+    m = inside.astype(bool)
+    U = np.where(m, np.nan_to_num(T), 0.0)
+    for _ in range(nstep):
+        acc = -4.0 * U
+        for sh, ax in ((1, 0), (-1, 0), (1, 1), (-1, 1)):
+            nb = np.roll(U, sh, ax); nm = np.roll(m, sh, ax)
+            acc += np.where(nm, nb, U)
+        U = np.where(m, U + k * dt / dx_mm ** 2 * acc, 0.0)
+    return np.where(m, U, np.nan)
+
+
+def locate_point(shape, W, H, x, y, rho_b):
+    """단면 위치를 말로: 평면부 중앙 / 모서리 / 그 사이 · 표면 / 내부 / 중심"""
+    rho = math.hypot(x, y)
+    depth = 1 - rho / max(rho_b, 1e-9)
+    radial = "표면" if depth < 0.12 else ("중심부" if depth > 0.65 else "표면 아래")
+    if depth > 0.65:
+        return "중심부"
+    phi = math.degrees(math.atan2(y, x)) % 360
+    if shape == SHAPE_TR:
+        ang = "직선부" if abs(x) <= max(0.0, (W - H) / 2) + 0.15 * H else "원호부"
+    else:
+        corners = ([30 + 60 * k for k in range(6)] if shape == SHAPE_HEX else
+                   [math.degrees(math.atan2(sy * H, sx * W)) % 360 for sx, sy in [(1, 1), (-1, 1), (-1, -1), (1, -1)]])
+        flats = [60 * k for k in range(6)] if shape == SHAPE_HEX else [0, 90, 180, 270]
+        dist = lambda a_, b_: min(abs(a_ - b_), 360 - abs(a_ - b_))
+        dc, dfl = min(dist(phi, c_) for c_ in corners), min(dist(phi, f_) for f_ in flats)
+        ang = "평면부 중앙" if dfl < 0.3 * (dfl + dc) else ("모서리" if dc < 0.3 * (dfl + dc) else "평면–모서리 사이")
+    return f"{ang} {radial}"
 
 
 st.markdown(f"""
@@ -921,12 +1149,35 @@ with tab1:
 """ if is_hex else ""))
             st.dataframe(CV_TABLE, hide_index=True, **FW_DF)
 
-    # ---------------- 3D ----------------
-    st.markdown("#### 3D 인발 형상 — 원형 소재 → 어프로치 → 예상 출구 단면")
+    # ---------------- 3D + 변형·온도 간이 해석 ----------------
+    st.markdown("#### 3D 인발 형상과 변형·온도 (간이 해석)")
+    with st.expander("해석 조건 — 다이 각 · 인발 속도 · 마찰 · 소재 강도 · 베어링", expanded=False):
+        h1, h2, h3, h4, h5 = st.columns(5)
+        two_alpha = h1.number_input("어프로치 각 2α (°)", value=30.0, min_value=4.0, max_value=60.0, step=1.0, key="t1_ap",
+                                    help="다이 라벨의 AP 값(사내 다이 AP 30·32). 반각 α = AP/2 로 계산합니다.")
+        v_mpm = h2.number_input("인발 속도 (m/min)", value=20.0, min_value=1.0, max_value=300.0, step=1.0, key="t1_vel")
+        mu_f = h3.number_input("마찰계수 μ", value=0.05, min_value=0.01, max_value=0.30, step=0.01, key="t1_mu",
+                               help="인산염 피막 + 비누 윤활 약 0.03–0.06, 윤활 불량이면 0.1 이상.")
+        ts_in = h4.number_input("소재 인장강도 TS (kgf/mm²)", value=55.0, min_value=20.0, max_value=150.0, step=1.0, key="t1_ts",
+                                help="2번 탭 강종표 참고: S20C 48.5 · S45C 71 · SCM435 96. 가공경화 지수 n = 0.18로 가정합니다.")
+        bl_in = h5.number_input("베어링 길이 (mm)", value=6.0, min_value=0.0, max_value=30.0, step=0.5, key="t1_bl",
+                                help="다이 라벨의 BL 값(사내 BL 6–8).")
+    dfz = None
+    if shape_type == SHAPE_TR or pred:
+        r_prod_df = (H / 2.0) if shape_type == SHAPE_TR else float(pred["p50"])
+        r_die_df = (H / 2.0) if shape_type == SHAPE_TR else float(R)
+        dfz = deform_fields(shape_type, float(W), float(H), r_prod_df, r_die_df, float(d_in),
+                            float(two_alpha), float(v_mpm), float(mu_f), float(ts_in), float(bl_in))
     v1, v2 = st.columns([3, 1])
+    FIELD_OPTS = ["다이 면압 (힘)", "유효 응력 (경도)", "온도", "유효 변형률", "형상만"]
+    color_opt = v2.radio("색 표시", FIELD_OPTS if dfz else ["형상만"], key="t1_3d_color",
+                         help="다이 면압: 다이가 소재를 누르는 힘(MPa) · 유효 응력: 가공경화로 단단해진 정도(MPa, 경도 환산) · "
+                              "온도: 인발 중 표면 온도 · 유효 변형률: 누적 소성변형량 — 모두 간이 해석")
+    band_on = v2.checkbox("FEM처럼 단계별 색", value=True, key="t1_cs_band", help="끄면 부드러운 무지개 색으로 표시합니다.")
     view_opt = v2.radio("보기 방향", ["측면 사선 (기본)", "출구 정면", "입구 정면"], key="t1_3d_view")
     show_die3d = v2.checkbox("출구에 다이 형상 겹치기", value=True, key="t1_3d_die")
-    v2.caption("길이 방향은 개략 비율입니다 (입구 소재 30 · 어프로치 50 · 베어링/제품 20).")
+    v2.caption("길이 방향은 개략 비율입니다 (입구 소재 30 · 어프로치 50 · 베어링/제품 20). 파랑 = 낮음, 빨강 = 높음.")
+    CS_F = fem_scale(band_on)
 
     n_pts = 180
     th3 = np.linspace(0, 2 * np.pi, n_pts, endpoint=False)
@@ -942,13 +1193,60 @@ with tab1:
 
     Z_IN, Z_AP, Z_END = 30.0, 80.0, 100.0
     z_levels = np.r_[np.linspace(0, Z_IN, 4), np.linspace(Z_IN, Z_AP, 26)[1:], np.linspace(Z_AP, Z_END, 5)[1:]]
-    X_3d, Y_3d, Z_3d = [], [], []
+    field_on = dfz is not None and color_opt != "형상만"
+    smooth = lambda t_: t_ * t_ * (3 - 2 * t_)
+    if dfz:
+        sig_of = lambda e: dfz["K"] * np.power(dfz["eps0"] + np.maximum(e, 0.0), dfz["n"])
+        hv_of = lambda sg: 0.306 * sg                                   # Tabor: HV ≈ 3σ/9.81
+        nrow = len(dfz["die_x"])
+
+        def die_row(xmm):
+            k_ = float(np.interp(xmm, dfz["die_x"], np.arange(nrow)))
+            i0 = min(int(k_), nrow - 2) if nrow > 1 else 0
+            w_ = k_ - i0
+            return dfz["die_P"][i0] * (1 - w_) + dfz["die_P"][min(i0 + 1, nrow - 1)] * w_
+
+        def x_of_z(z):
+            if z <= Z_IN:
+                return None
+            if z <= Z_AP:
+                return (z - Z_IN) / (Z_AP - Z_IN) * dfz["L_ap"]
+            return dfz["L_ap"] + (z - Z_AP) / (Z_END - Z_AP) * max(float(bl_in), 0.0)
+    FIELD_META = {
+        "다이 면압 (힘)": ("MPa", "%{intensity:.0f} MPa", 0.0),
+        "유효 응력 (경도)": ("MPa", "%{intensity:.0f} MPa", dfz["sig0"] if dfz else 0.0),
+        "온도": ("°C", "%{intensity:.0f} °C", 25.0),
+        "유효 변형률": ("ε", "ε %{intensity:.2f}", 0.0),
+    }
+    if field_on:
+        unit_, hov_, base_v = FIELD_META[color_opt]
+        eps_s3 = np.interp(th3, dfz["phi"], dfz["eps_surf"], period=2 * np.pi)
+        T_s3 = np.interp(th3, dfz["phi"], dfz["T_surf"], period=2 * np.pi)
+
+        def surf_vals(z):
+            t_ = 0.0 if z <= Z_IN else (1.0 if z >= Z_AP else (z - Z_IN) / (Z_AP - Z_IN))
+            f_ = smooth(t_)
+            tb = 0.0 if z <= Z_AP else (z - Z_AP) / (Z_END - Z_AP)
+            if color_opt == "온도":
+                return 25.0 + (T_s3 - 25.0) * (0.82 * f_ + 0.18 * tb)
+            if color_opt == "유효 변형률":
+                return eps_s3 * f_
+            if color_opt == "유효 응력 (경도)":
+                return sig_of(eps_s3 * f_)
+            xm = x_of_z(z)
+            if xm is None:
+                return np.zeros(n_pts)
+            return np.interp(th3, dfz["phi"], die_row(xm), period=2 * np.pi)
+        sec_field = {"온도": dfz["T"], "유효 변형률": dfz["eps"], "유효 응력 (경도)": dfz["sig"]}.get(color_opt)
+    X_3d, Y_3d, Z_3d, V_3d = [], [], [], []
     for z in z_levels:
         t = 0.0 if z <= Z_IN else (1.0 if z >= Z_AP else (z - Z_IN) / (Z_AP - Z_IN))
-        f = t * t * (3 - 2 * t)  # 부드러운 전이
+        f = smooth(t)
         X_3d.extend((1 - f) * x_in3 + f * x_out)
         Y_3d.extend((1 - f) * y_in3 + f * y_out)
         Z_3d.extend([z] * n_pts)
+        if field_on:
+            V_3d.extend(surf_vals(z))
     nL = len(z_levels)
     I, J, K = [], [], []
     for i in range(nL - 1):
@@ -964,20 +1262,70 @@ with tab1:
     nb = len(X_3d)
     cx_, cy_, cz_, ci, cj, ck = _cap(x_in3, y_in3, 0.0, nb)
     X_3d += cx_; Y_3d += cy_; Z_3d += cz_; I += ci; J += cj; K += ck
+    if field_on:
+        V_3d += [base_v] * (n_pts + 1)
     nb = len(X_3d)
     cx_, cy_, cz_, ci, cj, ck = _cap(x_out, y_out, Z_END, nb)
     X_3d += cx_; Y_3d += cy_; Z_3d += cz_; I += ci; J += cj; K += ck
+    if field_on:
+        V_3d += list(surf_vals(Z_END)) + [float(np.nanmin(sec_field)) if sec_field is not None else base_v]
 
     fig_3d = go.Figure()
-    fig_3d.add_trace(go.Mesh3d(x=X_3d, y=Y_3d, z=Z_3d, i=I, j=J, k=K, intensity=Z_3d,
-                               colorscale=[[0, "#AEB6BE"], [0.3, "#9FB6D3"], [0.8, TEMPER_BLUE], [1, "#173A63"]],
-                               showscale=False, opacity=1.0, flatshading=False, name="인발재",
-                               lighting=dict(ambient=0.45, diffuse=0.8, specular=0.25, roughness=0.5, fresnel=0.1),
-                               lightposition=dict(x=200, y=-300, z=400), hoverinfo="skip"))
+    scene_ann = []
+    if field_on:
+        vmax = float(np.nanmax(V_3d))
+        if sec_field is not None:
+            vmax = max(vmax, float(np.nanmax(sec_field)))
+        vmin = min(base_v, float(np.nanmin(V_3d)))
+        fig_3d.add_trace(go.Mesh3d(x=X_3d, y=Y_3d, z=Z_3d, i=I, j=J, k=K, intensity=V_3d,
+                                   colorscale=CS_F, cmin=vmin, cmax=vmax,
+                                   showscale=True, colorbar=dict(title=unit_, len=0.62, thickness=14, x=1.0, nticks=13),
+                                   opacity=1.0, flatshading=False, name="인발재",
+                                   lighting=dict(ambient=0.72, diffuse=0.55, specular=0.1, roughness=0.7, fresnel=0.05),
+                                   lightposition=dict(x=200, y=-300, z=400), hovertemplate=hov_ + "<extra></extra>"))
+        xg3 = dfz["x"]
+        if sec_field is not None:                                     # 출구 끝면 = 단면 분포
+            fig_3d.add_trace(go.Surface(x=xg3, y=xg3, z=np.where(np.isnan(sec_field), np.nan, Z_END + 0.08), surfacecolor=sec_field,
+                                        colorscale=CS_F, cmin=vmin, cmax=vmax, showscale=False, hoverinfo="skip",
+                                        lighting=dict(ambient=0.9, diffuse=0.2), name="출구 단면"))
+        else:
+            fig_3d.add_trace(go.Surface(x=xg3, y=xg3, z=np.where(np.isnan(dfz["sig"]), np.nan, Z_END + 0.08),
+                                        surfacecolor=np.zeros_like(dfz["sig"]), colorscale=[[0, "#C9CED3"], [1, "#C9CED3"]],
+                                        showscale=False, hoverinfo="skip", name="출구 단면"))
+        # 최댓값 위치 표시
+        if color_opt == "다이 면압 (힘)":
+            Pm_ = dfz["die_P"]
+            near = np.argwhere(Pm_ >= 0.995 * Pm_.max())                    # 최댓값과 같은 곳 중 화면 쪽(카메라 방향)을 표시
+            cam_ang = {"측면 사선 (기본)": math.atan2(0.95, -1.75)}.get(view_opt, math.pi / 2)
+            ang_d = np.abs((dfz["phi"][near[:, 1]] - cam_ang + np.pi) % (2 * np.pi) - np.pi)
+            ip, jp = near[int(np.argmin(ang_d))]
+            xh = float(dfz["die_x"][ip]); ph = float(dfz["phi"][jp])
+            zh = (Z_IN + xh / dfz["L_ap"] * (Z_AP - Z_IN)) if xh <= dfz["L_ap"] else (Z_AP + (xh - dfz["L_ap"]) / max(float(bl_in), 1e-6) * (Z_END - Z_AP))
+            fh = smooth(min(1.0, max(0.0, (zh - Z_IN) / (Z_AP - Z_IN))))
+            rh = (1 - fh) * d_in / 2.0 + fh * float(np.interp(ph, th3, np.hypot(x_out, y_out), period=2 * np.pi))
+            hot3 = (rh * 1.05 * math.cos(ph), rh * 1.05 * math.sin(ph), zh, f"최대 면압 {float(dfz['die_P'].max()):.0f} MPa")
+        else:
+            sf_ = np.nan_to_num(sec_field, nan=-1e18)
+            near = np.argwhere(sf_ >= float(np.nanmax(sec_field)) - 0.005 * (float(np.nanmax(sec_field)) - float(np.nanmin(sec_field)) + 1e-9))
+            cam_ang = {"측면 사선 (기본)": math.atan2(0.95, -1.75)}.get(view_opt, math.pi / 2)
+            ang_n = np.arctan2(xg3[near[:, 0]], xg3[near[:, 1]])
+            ih = near[int(np.argmin(np.abs((ang_n - cam_ang + np.pi) % (2 * np.pi) - np.pi)))]
+            fmt_ = {"온도": "최고 {:.0f} °C", "유효 변형률": "최대 ε {:.2f}", "유효 응력 (경도)": "최대 {:.0f} MPa"}[color_opt]
+            hot3 = (float(xg3[ih[1]]), float(xg3[ih[0]]), Z_END + 0.4, fmt_.format(float(np.nanmax(sec_field))))
+        fig_3d.add_trace(go.Scatter3d(x=[hot3[0]], y=[hot3[1]], z=[hot3[2]], mode="markers",
+                                      marker=dict(size=7, color="#FFFFFF", line=dict(color=INK, width=3)), showlegend=False, hoverinfo="skip"))
+        scene_ann = [dict(x=hot3[0], y=hot3[1], z=hot3[2], text=f"<b>{hot3[3]}</b>", showarrow=True, arrowhead=2, arrowcolor=INK,
+                          ax=-60, ay=-46, font=dict(size=13, color=INK), bgcolor="rgba(255,255,255,0.95)", bordercolor=INK, borderwidth=1)]
+    else:
+        fig_3d.add_trace(go.Mesh3d(x=X_3d, y=Y_3d, z=Z_3d, i=I, j=J, k=K, intensity=Z_3d,
+                                   colorscale=[[0, "#AEB6BE"], [0.3, "#9FB6D3"], [0.8, TEMPER_BLUE], [1, "#173A63"]],
+                                   showscale=False, opacity=1.0, flatshading=False, name="인발재",
+                                   lighting=dict(ambient=0.45, diffuse=0.8, specular=0.25, roughness=0.5, fresnel=0.1),
+                                   lightposition=dict(x=200, y=-300, z=400), hoverinfo="skip"))
     fig_3d.add_trace(go.Scatter3d(x=np.r_[x_in3, x_in3[0]], y=np.r_[y_in3, y_in3[0]], z=np.zeros(n_pts + 1), mode="lines",
                                   line=dict(color=MUTED, width=5), name=f"입구 원형 Ø{d_in:.1f}"))
     fig_3d.add_trace(go.Scatter3d(x=np.r_[x_out, x_out[0]], y=np.r_[y_out, y_out[0]], z=np.full(n_pts + 1, Z_END), mode="lines",
-                                  line=dict(color=STRAW, width=7), name=f"출구 {out_label}"))
+                                  line=dict(color=INK if field_on else STRAW, width=5 if field_on else 7), name=f"출구 {out_label}"))
     if show_die3d and shape_type != SHAPE_TR:
         xd3, yd3 = rounded_polygon(shape_type, W, H, R, 720)
         fig_3d.add_trace(go.Scatter3d(x=np.r_[xd3, xd3[0]], y=np.r_[yd3, yd3[0]], z=np.full(len(xd3) + 1, Z_END + 0.3), mode="lines",
@@ -998,7 +1346,7 @@ with tab1:
             xaxis=dict(title="x (mm)", range=[-lim3, lim3], backgroundcolor="#F6F7F8"),
             yaxis=dict(title="y (mm)", range=[-lim3, lim3], backgroundcolor="#F6F7F8"),
             zaxis=dict(title="인발 방향 →", range=[0, Z_END + 2], backgroundcolor="#EEF0F2", showticklabels=False),
-            aspectmode="manual", aspectratio=dict(x=1, y=1, z=2.2), camera=cams[view_opt],
+            aspectmode="manual", aspectratio=dict(x=1, y=1, z=2.2), camera=cams[view_opt], annotations=scene_ann,
         ),
         height=560, margin=dict(l=0, r=0, t=40, b=0), paper_bgcolor="rgba(0,0,0,0)", font=dict(color=INK),
         legend=dict(orientation="h", y=1.0, x=0.0, yanchor="bottom", bgcolor="rgba(255,255,255,0.7)"),
@@ -1006,6 +1354,160 @@ with tab1:
     )
     fig_3d.update_layout(font=dict(family=FONT_SANS, size=12, color=INK))
     v1.plotly_chart(fig_3d, **FW_CHART)
+
+    # ---------------- 출구 단면 · 다이 면 지도 ----------------
+    if dfz:
+        st.markdown("#### 어디가 가장 힘을 받고, 단단해지고, 뜨거운가")
+        xg = dfz["x"]
+        Ee, Tt, Ss = dfz["eps"], dfz["T"], dfz["sig"]
+        rho_at = lambda xx, yy: float(np.interp(math.atan2(yy, xx) % (2 * np.pi), dfz["phi"], dfz["rho"], period=2 * np.pi))
+
+        def where_(F):
+            ii = np.unravel_index(int(np.nanargmax(F)), F.shape)
+            xx, yy = float(xg[ii[1]]), float(xg[ii[0]])
+            return xx, yy, locate_point(shape_type, W, H, xx, yy, rho_at(xx, yy))
+        xe_, ye_, loc_e = where_(Ee)
+        xs2, ys2, loc_s = where_(Ss)
+        xt_, yt_, loc_t = where_(Tt)
+        ip, jp = np.unravel_index(int(np.argmax(dfz["die_P"])), dfz["die_P"].shape)
+        P_max, x_pmax, ph_p = float(dfz["die_P"].max()), float(dfz["die_x"][ip]), float(dfz["phi"][jp])
+        rb_p = float(np.interp(ph_p, dfz["phi"], dfz["rho"], period=2 * np.pi))
+        loc_p = locate_point(shape_type, W, H, rb_p * math.cos(ph_p), rb_p * math.sin(ph_p), rb_p).replace(" 표면", "")
+        where_p = ("베어링 안" if x_pmax > dfz["L_ap"] + 1e-6 else
+                   f"어프로치 입구에서 {x_pmax:.0f} mm 들어간 곳 (어프로치 접촉 길이 {dfz['L_ap']:.0f} mm 중 {x_pmax / dfz['L_ap'] * 100:.0f}% 지점)")
+        if shape_type == SHAPE_TR:
+            ang_c, c_name = 0.0, "원호부(양 끝)"
+        else:
+            ang_c, c_name = (math.pi / 6 if shape_type == SHAPE_HEX else math.atan2(H, W)), "모서리"
+        e_c = float(np.interp(ang_c, dfz["phi"], dfz["eps_surf"], period=2 * np.pi))
+        T_c = float(np.interp(ang_c, dfz["phi"], dfz["T_surf"], period=2 * np.pi))
+        s_c = float(sig_of(e_c))
+        col_c = dfz["die_P"][:, int(np.argmin(np.abs(dfz["phi"] - ang_c)))]
+        P_c = float(col_c.max())
+        e_max, T_max, s_max = float(np.nanmax(Ee)), float(np.nanmax(Tt)), float(np.nanmax(Ss))
+        T05 = cool_down(Tt, dfz["inside"], dfz["dx"], 0.5)
+        if shape_type == SHAPE_TR:
+            why_c = ""
+        elif e_c < 0.85 * e_max and T_c < 0.8 * T_max:
+            why_c = " — 다이와 닿는 길이가 짧아 덜 변형되고 덜 뜨거움 (모서리 R이 생기는 것과 같은 이유)"
+        elif pred and pred["p_fill"] >= 0.5:
+            why_c = " — 모서리까지 소재가 꽉 차면서 변형이 큼"
+        else:
+            why_c = ""
+        st.markdown(f"""
+<div class="ra-box">
+  <div class="ra-title">한눈에 보기 (인발 속도 {v_mpm:.0f} m/min · 2α {two_alpha:.0f}° · μ {mu_f:.2f} · TS {ts_in:.0f} kgf/mm²)</div>
+  <div class="ra-msg">
+    <b>가장 힘을 받는 곳</b>: 다이의 <b>{loc_p}</b> 쪽, {where_p} — 면압 약 <b>{P_max:.0f} MPa</b>. 다이가 가장 빨리 닳는 곳입니다.<br>
+    <b>가장 단단해지는 곳</b>: 제품 {loc_s} — 유효 응력 <b>{s_max:.0f} MPa</b> (경도 약 HV {hv_of(s_max):.0f}) · 중심 {dfz['sig_axis']:.0f} MPa (HV {hv_of(dfz['sig_axis']):.0f}) · 투입재 {dfz['sig0']:.0f} MPa.<br>
+    <b>가장 뜨거운 곳</b>: {loc_t} <b>{T_max:.0f} °C</b> — 표면 {dfz['depth_mm']:.1f} mm 이내 얇은 층의 순간 온도. 출구 0.5초 뒤 최고 {float(np.nanmax(T05)):.0f} °C, 2초 뒤면 단면 전체가 약 <b>{dfz['T_mean']:.0f} °C</b>로 고르게 됩니다 (출구 뒤 온도계로 재는 값).<br>
+    <b>{c_name}</b>: 면압 {P_c:.0f} MPa · 응력 {s_c:.0f} MPa · ε {e_c:.2f} · {T_c:.0f} °C{why_c}.
+  </div>
+</div>""", unsafe_allow_html=True)
+
+        def _sec_fig(Z, title, unit_fmt, hot_xy, hot_txt, center_txt, zmin, cbar_t):
+            fg = go.Figure(go.Heatmap(x=xg, y=xg, z=Z, colorscale=CS_F, zmin=float(np.nanmin(Z)), zmax=float(np.nanmax(Z)), zsmooth="best",
+                                      colorbar=dict(thickness=12, len=0.85, title=cbar_t, nticks=13), hovertemplate=unit_fmt + "<extra></extra>"))
+            if shape_type != SHAPE_TR:
+                xd_, yd_ = rounded_polygon(shape_type, W, H, R, 360)
+                fg.add_trace(go.Scatter(x=np.r_[xd_, xd_[0]], y=np.r_[yd_, yd_[0]], mode="lines", line=dict(color=INK, width=1.2, dash="dot"),
+                                        hoverinfo="skip", showlegend=False))
+            xb_, yb_ = _section_boundary(shape_type, W, H, (H / 2.0) if shape_type == SHAPE_TR else pred["p50"])
+            fg.add_trace(go.Scatter(x=np.r_[xb_, xb_[0]], y=np.r_[yb_, yb_[0]], mode="lines", line=dict(color=INK, width=1.6),
+                                    hoverinfo="skip", showlegend=False))
+            fg.add_trace(go.Scatter(x=[hot_xy[0]], y=[hot_xy[1]], mode="markers", marker=dict(symbol="circle-open", size=16, color=INK,
+                                    line=dict(width=2.5)), hoverinfo="skip", showlegend=False))
+            ux, uy = hot_xy[0], hot_xy[1]
+            nrm_ = max(math.hypot(ux, uy), 1e-6)
+            fg.add_annotation(x=ux, y=uy, ax=ux + 0.24 * xg.max() * ux / nrm_, ay=uy + 0.24 * xg.max() * uy / nrm_, axref="x", ayref="y",
+                              showarrow=True, arrowhead=2, arrowcolor=INK, text=f"<b>{hot_txt}</b>", font=dict(size=13, color=INK),
+                              bgcolor="rgba(255,255,255,0.92)", bordercolor=INK, borderwidth=1)
+            fg.add_annotation(x=0, y=0, text=center_txt, showarrow=False, font=dict(size=12, color=INK), bgcolor="rgba(255,255,255,0.85)")
+            lim_ = xg.max() * 1.28
+            fg.update_layout(title=title, height=430, margin=dict(l=10, r=10, t=46, b=10),
+                             xaxis=dict(scaleanchor="y", scaleratio=1, range=[-lim_, lim_], showticklabels=False, showgrid=False, zeroline=False),
+                             yaxis=dict(range=[-lim_, lim_], showticklabels=False, showgrid=False, zeroline=False))
+            style_fig(fg)
+            fg.update_xaxes(showgrid=False, showticklabels=False, zeroline=False); fg.update_yaxes(showgrid=False, showticklabels=False, zeroline=False)
+            return fg
+
+        s1c, s2c = st.columns(2)
+        left_opt = s1c.radio("왼쪽 단면", ["유효 응력 (경도)", "유효 변형률"], horizontal=True, key="t1_sec_left")
+        t_opt = s2c.radio("온도 보는 시점", ["출구 직후", "0.5초 뒤", "2초 뒤"], horizontal=True, key="t1_sec_time",
+                          help=f"인발 속도 {v_mpm:.0f} m/min이면 0.5초 = 출구에서 {v_mpm / 60 * 0.5:.2f} m, 2초 = {v_mpm / 60 * 2:.2f} m 지난 위치")
+        if left_opt == "유효 응력 (경도)":
+            s1c.plotly_chart(_sec_fig(Ss, "유효 응력 — 가공경화로 단단해진 정도 (MPa)", "%{z:.0f} MPa", (xs2, ys2),
+                                      f"최대 {s_max:.0f} MPa · HV {hv_of(s_max):.0f}", f"중심 {dfz['sig_axis']:.0f}", dfz["sig0"], "MPa"), **FW_CHART)
+        else:
+            s1c.plotly_chart(_sec_fig(Ee, "유효 변형률 ε (누적 소성변형)", "ε %{z:.2f}", (xe_, ye_), f"최대 ε {e_max:.2f}",
+                                      f"중심 {dfz['eps_axis']:.2f}", 0.0, "ε"), **FW_CHART)
+        t_sec = {"출구 직후": 0.0, "0.5초 뒤": 0.5, "2초 뒤": 2.0}[t_opt]
+        Tv = Tt if t_sec == 0 else cool_down(Tt, dfz["inside"], dfz["dx"], t_sec)
+        iv = np.unravel_index(int(np.nanargmax(Tv)), Tv.shape)
+        s2c.plotly_chart(_sec_fig(Tv, f"온도 — {t_opt} (°C)", "%{z:.0f} °C", (float(xg[iv[1]]), float(xg[iv[0]])),
+                                  f"최고 {float(np.nanmax(Tv)):.0f} °C", f"중심 {float(Tv[len(xg) // 2, len(xg) // 2]):.0f} °C", 25.0, "°C"), **FW_CHART)
+
+        # 다이 면 펼친 그림
+        ph_deg = np.degrees(dfz["phi"])
+        sel = ph_deg <= 180.0 + 1e-9
+        fd = go.Figure(go.Heatmap(x=dfz["die_x"], y=ph_deg[sel], z=dfz["die_P"][:, sel].T, colorscale=CS_F, zmin=0, zmax=P_max,
+                                  zsmooth="best", colorbar=dict(thickness=12, len=0.9, title="MPa", nticks=13),
+                                  hovertemplate="다이 속 %{x:.1f} mm · 둘레 %{y:.0f}°<br>면압 %{z:.0f} MPa<extra></extra>"))
+        if shape_type == SHAPE_HEX:
+            ticks = [(a_, "평면 중앙") for a_ in (0, 60, 120, 180)] + [(a_, "모서리") for a_ in (30, 90, 150)]
+        elif shape_type == SHAPE_TR:
+            ticks = [(0, "원호 끝"), (90, "직선부 중앙"), (180, "원호 끝")]
+        else:
+            ca = math.degrees(math.atan2(H, W))
+            ticks = [(0, "평면 중앙 (W)"), (90, "평면 중앙 (H)"), (180, "평면 중앙 (W)"), (ca, "모서리"), (180 - ca, "모서리")]
+        ticks.sort()
+        fd.add_vline(x=dfz["L_ap"], line=dict(color=INK, dash="dot", width=1.2), annotation_text="베어링 시작", annotation_position="top")
+        fd.add_trace(go.Scatter(x=[x_pmax], y=[min(math.degrees(ph_p), 360 - math.degrees(ph_p))], mode="markers+text",
+                                text=[f"<b>최대 {P_max:.0f} MPa</b>"], textposition="top right", textfont=dict(size=12, color=INK),
+                                marker=dict(symbol="circle-open", size=16, color=INK, line=dict(width=2.5)), hoverinfo="skip", showlegend=False))
+        fd.update_layout(title="다이 면압 — 다이 안쪽 면을 펼친 그림 (어디가 가장 힘을 받나)", height=340, margin=dict(l=10, r=10, t=46, b=10),
+                         xaxis=dict(title="다이 속 위치 (mm) — 0 = 소재가 처음 닿는 곳, 인발 방향 →", showgrid=False),
+                         yaxis=dict(title="둘레 위치", tickvals=[t_[0] for t_ in ticks], ticktext=[t_[1] for t_ in ticks], showgrid=False, range=[-6, 186]))
+        style_fig(fd)
+        fd.update_xaxes(showgrid=False); fd.update_yaxes(showgrid=False)
+        st.plotly_chart(fd, **FW_CHART)
+
+        q1, q2, q3, q4 = st.columns(4)
+        q1.metric("최대 다이 면압", f"{P_max:.0f} MPa", loc_p, delta_color="off")
+        q2.metric("최대 유효 응력", f"{s_max:.0f} MPa", f"경도 약 HV {hv_of(s_max):.0f} · {loc_s}", delta_color="off")
+        q3.metric("표면 순간 최고 온도", f"{T_max:.0f} °C", f"표면 {dfz['depth_mm']:.1f} mm 이내 · {loc_t}", delta_color="off")
+        q4.metric("봉 전체 평균 온도", f"{dfz['T_mean']:.0f} °C", "출구 1–2초 뒤 측정값에 가까움", delta_color="off")
+        st.caption("점선 = 다이, 실선 = 예상 제품. 간이 해석은 경향(어디가 더/덜)을 보는 용도입니다 — FEM(AFDEX 등)처럼 응력·속도장을 푼 값이 아닙니다. "
+                   "연속 작업으로 다이가 데워지면 표면 온도는 더 올라가고, 다이로 빠지는 열·공기 냉각을 넣으면 평균 온도는 조금 내려갑니다.")
+        with st.expander("간이 해석 방법 · 외부 FEM·실측과 비교 · 한계"):
+            st.markdown(f"""
+- **형상 변화**: 원형 단면을 '면적 비율이 같은 부채꼴끼리' 제품 단면에 대응시키고(표면일수록 제품 형상, 중심일수록 균일 축소), 최종 변형 기울기로 유효 변형률을 계산 — 균일 변형 ln λ = **{dfz['eps_h']:.3f}** (λ {dfz['lam']:.3f})
+- **표면 전단(잉여변형)**: Δ = (α/r)(1+√(1−r))² = **{dfz['Delta']:.2f}**, 잉여일 계수 Φ = 0.8 + Δ/4.4 = **{dfz['Phi']:.2f}** (Hosford–Caddell). 반경에 비례하고, 다이가 깊게 누르는 방향(평면부 중앙)일수록 크게 배분
+- **유효 응력·경도**: Swift 경화식 σ = K(ε₀+ε)ⁿ, n 0.18, K는 TS에서 추정({dfz['K']:.0f} MPa), 투입재 항복 ≈ 0.65·TS. 경도는 HV ≈ 0.31·σ(MPa) (Tabor 근사) — 단면 경도를 재면 바로 맞춰볼 수 있습니다
+- **다이 면압**: Sachs 슬래브법으로 축 방향 인발응력을 쌓아 가며 면압 = 유동응력 − 인발응력. 각 둘레 위치는 다이가 소재에 닿기 시작하는 곳부터 면압이 생기고, 모서리처럼 안 닿는 곳은 0. 출구 인발응력 {dfz['sig_draw']:.0f} MPa (출구 유동응력의 {dfz['sig_draw'] / dfz['sf_exit'] * 100:.0f} %)
+- **변형열**: 소성일의 90 %가 열 · 강 ρc = 3.61 MJ/m³K
+- **마찰열**: 전단 μ·면압 × 접촉 길이(어프로치 + 베어링), 그중 35 %가 소재로, 접촉 시간 최대 {dfz['t_contact'] * 1000:.0f} ms 동안 표면 가열(반무한체 해). 출구 뒤는 단면 안 열전도로 고르게 퍼짐(공기 냉각 무시)
+- **한계**: 가공 발열에 의한 연화, 다이 온도 상승, 윤활막 상태, 다이 입구·베어링 입구의 국부 면압 집중, 잔류응력은 반영하지 않음
+""")
+            ext_cmp = []
+            for nm, shp_x, Wx, d0x, fem in [("S3 사각", SHAPE_SQ, 13.98, 17.0, (0.215, 0.377)), ("H2 육각", SHAPE_HEX, 13.99, 16.8, (0.287, 0.398)),
+                                            ("H3 육각", SHAPE_HEX, 13.99, 15.8, (0.159, 0.275))]:
+                prx = predict_R(shp_x, Wx, Wx, d0x, 0.0, MODEL)
+                fx = deform_fields(shp_x, Wx, Wx, float(prx["p50"]), 0.0, d0x, 16.0)
+                ext_cmp.append({"시편": nm, "조건": f"Ø{d0x:.1f} → {Wx:.0f}", "FEM 중심 ε": fem[0], "간이 중심 ε": round(fx["eps_axis"], 3),
+                                "FEM 표면 ε": fem[1], "간이 표면 평균 ε": round(float(np.mean(fx["eps_surf"])), 3),
+                                "간이 표면 최대 ε": round(float(np.max(fx["eps_surf"])), 3)})
+            st.dataframe(pd.DataFrame(ext_cmp), hide_index=True, **FW_DF)
+            st.caption("변형률 FEM: Rumiński·Skubisz·Micek (2025) Table 5 (스테인리스, 다이 각 미기재 → 간이 해석은 논문의 최적각 2α 16°로 계산). "
+                       "논문도 '변형이 각 변 중앙에 집중되고, 모서리는 덜 경화'된다고 보고 — 간이 해석의 분포 경향과 같습니다.")
+            fT = deform_fields(SHAPE_TR, 11.63, 11.63, 11.63 / 2, 11.63 / 2, 13.0, 12.0, 4.2, 0.10, 46.0, 3.0, 0.16, 26.0)
+            st.dataframe(pd.DataFrame([
+                {"구분": "논문 FEM·실측 (강선 Ø13 → Ø11.63, 감면율 20 %, 4.2 m/min, 반각 6°)", "표면 최고 (°C)": "약 93 (고경화재 n 0.5)",
+                 "중심 (°C)": "42 → 62", "비고": "표면은 베어링 입구에서 최고, 이후 안쪽으로 퍼짐"},
+                {"구분": "간이 해석 (같은 조건, μ 0.10, TS 46, n 0.16)", "표면 최고 (°C)": f"{float(np.nanmax(fT['T'])):.0f}",
+                 "중심 (°C)": f"{fT['T_axis']:.0f} (평균 {fT['T_mean']:.0f})", "비고": "마찰열 35 %가 소재로 들어가도록 맞춤"},
+            ]), hide_index=True, **FW_DF)
+            st.caption("온도 비교: Materials 16(14) 5203 (2023), 'Influence of Strain Hardening Rate of Material on Temperature and Strain Distributions during Wire Drawing'.")
 
 # ==========================================
 # [TAB 2] 인발력 산출 및 설비 부하 검증
